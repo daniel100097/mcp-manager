@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mcp-manager configuration",
+  "description": "Central MCP definitions and scope assignments consumed by mcp-manager.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "global",
+    "projects",
+    "mcps"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional editor hint pointing to this JSON Schema."
+    },
+    "version": {
+      "const": 2,
+      "description": "Configuration format version."
+    },
+    "options": {
+      "$ref": "#/$defs/options"
+    },
+    "global": {
+      "$ref": "#/$defs/scope"
+    },
+    "projects": {
+      "type": "object",
+      "description": "Named projects and their project-scoped MCP assignments.",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "patternProperties": {
+        "^[A-Za-z0-9_-]+$": {
+          "$ref": "#/$defs/project"
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcps": {
+      "type": "object",
+      "description": "Reusable transport-only MCP definitions. Activation belongs to global or projects.",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "patternProperties": {
+        "^[A-Za-z0-9_-]+$": {
+          "$ref": "#/$defs/mcp"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inlineSecrets": {
+          "type": "boolean",
+          "default": false,
+          "description": "Resolve envFrom and headersFrom and write their values into generated agent configs."
+        },
+        "stdioMode": {
+          "type": "string",
+          "enum": [
+            "wrapper",
+            "direct"
+          ],
+          "default": "wrapper",
+          "description": "wrapper generates stdio entries that run `mcp-manager stdio NAME` and resolve the real command at launch; direct writes the real command, args, and env into agent configs."
+        }
+      }
+    },
+    "agent": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "opencode"
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "mcpNames": {
+      "type": "array",
+      "description": "Unique MCP names defined by the top-level mcps object.",
+      "items": {
+        "$ref": "#/$defs/identifier"
+      },
+      "uniqueItems": true
+    },
+    "disabledAgents": {
+      "type": "object",
+      "description": "Active MCP names mapped to agents excluded only in this scope.",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "patternProperties": {
+        "^[A-Za-z0-9_-]+$": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/agent"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mcps"
+      ],
+      "properties": {
+        "mcps": {
+          "$ref": "#/$defs/mcpNames"
+        },
+        "disabledAgents": {
+          "$ref": "#/$defs/disabledAgents"
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "mcps"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Existing absolute project directory; a leading ~/ is also supported."
+        },
+        "mcps": {
+          "$ref": "#/$defs/mcpNames"
+        },
+        "disabledAgents": {
+          "$ref": "#/$defs/disabledAgents"
+        }
+      }
+    },
+    "environmentName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "noNulString": {
+      "type": "string",
+      "not": {
+        "pattern": "\u0000"
+      }
+    },
+    "environment": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "patternProperties": {
+        "^[A-Za-z_][A-Za-z0-9_]*$": {
+          "$ref": "#/$defs/noNulString"
+        }
+      },
+      "additionalProperties": false
+    },
+    "headerName": {
+      "type": "string",
+      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    },
+    "headers": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/headerName"
+      },
+      "patternProperties": {
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$": {
+          "type": "string",
+          "not": {
+            "pattern": "[\r\n\u0000]"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "headersFrom": {
+      "type": "object",
+      "description": "HTTP header names mapped to environment variables whose values supply the headers.",
+      "propertyNames": {
+        "$ref": "#/$defs/headerName"
+      },
+      "patternProperties": {
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$": {
+          "$ref": "#/$defs/environmentName"
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "stdio",
+            "http"
+          ]
+        },
+        "command": {
+          "type": "string",
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\u0000"
+          }
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/noNulString"
+          }
+        },
+        "env": {
+          "$ref": "#/$defs/environment"
+        },
+        "envFrom": {
+          "type": "array",
+          "description": "Environment variable names forwarded without storing their values in the central config.",
+          "items": {
+            "$ref": "#/$defs/environmentName"
+          },
+          "uniqueItems": true
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://"
+        },
+        "headers": {
+          "$ref": "#/$defs/headers"
+        },
+        "headersFrom": {
+          "$ref": "#/$defs/headersFrom"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "stdio"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "command"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "url"
+                  ]
+                },
+                {
+                  "required": [
+                    "headers"
+                  ]
+                },
+                {
+                  "required": [
+                    "headersFrom"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "http"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "url"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "command"
+                  ]
+                },
+                {
+                  "required": [
+                    "args"
+                  ]
+                },
+                {
+                  "required": [
+                    "env"
+                  ]
+                },
+                {
+                  "required": [
+                    "envFrom"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release_metadata.outputs.version }}
+      build_date: ${{ steps.release_metadata.outputs.build_date }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag and derive release metadata
+        id: release_metadata
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          if [[ ! "$tag" =~ $semver ]]; then
+            echo "Release tag must be semantic versioning in the form v1.2.3 (optionally with prerelease/build metadata), got: $tag" >&2
+            exit 1
+          fi
+
+          commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          build_date="$(date --utc --date="@$commit_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$build_date" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        goos:
+          - linux
+          - darwin
+          - windows
+        goarch:
+          - amd64
+          - arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and archive binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          BUILD_DATE: ${{ needs.verify.outputs.build_date }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+
+          extension=""
+          if [[ "$GOOS" == "windows" ]]; then
+            extension=".exe"
+          fi
+
+          binary="mcp-manager${extension}"
+          asset="mcp-manager_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p stage dist
+
+          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+            go build \
+              -trimpath \
+              -ldflags="-s -w -X github.com/daniel100097/mcp-manager/internal/buildinfo.Version=${VERSION} -X github.com/daniel100097/mcp-manager/internal/buildinfo.Commit=${GITHUB_SHA} -X github.com/daniel100097/mcp-manager/internal/buildinfo.Date=${BUILD_DATE}" \
+              -o "stage/${binary}" \
+              ./cmd/mcp-manager
+
+          if [[ "$GOOS" == "windows" ]]; then
+            (
+              cd stage
+              zip -9 -X "../dist/${asset}.zip" "$binary"
+            )
+          else
+            tar -czf "dist/${asset}.tar.gz" -C stage "$binary"
+          fi
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - verify
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          cd dist
+          sha256sum mcp-manager_* > checksums.txt
+          sha256sum --check checksums.txt
+          cat checksums.txt
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease+=(--prerelease)
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" mcp-manager_* checksums.txt --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME" \
+              "${prerelease[@]}" \
+              mcp-manager_* checksums.txt
+          fi

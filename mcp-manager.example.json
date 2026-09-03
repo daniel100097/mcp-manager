@@ -1,0 +1,59 @@
+{
+  "$schema": "./mcp-manager.schema.json",
+  "version": 2,
+  "options": {
+    "inlineSecrets": false,
+    "stdioMode": "wrapper"
+  },
+  "global": {
+    "mcps": [
+      "team-api"
+    ],
+    "disabledAgents": {
+      "team-api": [
+        "opencode"
+      ]
+    }
+  },
+  "projects": {
+    "mcp-manager": {
+      "path": "/home/me/code/mcp-manager",
+      "mcps": [
+        "workspace-files",
+        "team-api"
+      ],
+      "disabledAgents": {
+        "workspace-files": [
+          "claude"
+        ]
+      }
+    }
+  },
+  "mcps": {
+    "workspace-files": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/me/code/mcp-manager"
+      ],
+      "env": {
+        "LOG_LEVEL": "info"
+      },
+      "envFrom": [
+        "GITHUB_TOKEN"
+      ]
+    },
+    "team-api": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "X-Client": "mcp-manager"
+      },
+      "headersFrom": {
+        "X-API-Key": "TEAM_MCP_API_KEY"
+      }
+    }
+  }
+}

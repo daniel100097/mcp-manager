@@ -1,0 +1,10 @@
+# Go build and test output
+/dist/
+/stage/
+/mcp-manager
+/mcp-manager.exe
+/coverage.out
+*.test
+
+# OS metadata
+.DS_Store
