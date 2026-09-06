@@ -141,7 +141,10 @@ func Sync(cfg *config.Config, options Options) (Result, error) {
 		options.LookupEnv = os.LookupEnv
 	}
 
-	targets := buildTargets(cfg, options)
+	targets, err := buildTargets(cfg, options)
+	if err != nil {
+		return Result{}, err
+	}
 	if err := rejectTargetCollisions(targets); err != nil {
 		return Result{}, err
 	}
@@ -220,7 +223,7 @@ func newRenderSettings(cfg *config.Config, options Options) (renderSettings, err
 	return settings, nil
 }
 
-func buildTargets(cfg *config.Config, options Options) []target {
+func buildTargets(cfg *config.Config, options Options) ([]target, error) {
 	targets := []target{
 		{
 			path: filepath.Join(options.HomeDir, ".codex", "config.toml"), agent: config.AgentCodex,
@@ -237,28 +240,51 @@ func buildTargets(cfg *config.Config, options Options) []target {
 	}
 
 	projectIDs := make([]string, 0, len(cfg.Projects))
+	explicitRoots := make(map[string]bool, len(cfg.Projects))
 	for id := range cfg.Projects {
 		projectIDs = append(projectIDs, id)
+		explicitRoots[filepath.Clean(cfg.Projects[id].Path)] = true
 	}
 	sort.Strings(projectIDs)
+	discoveredOwners := map[string]string{}
 	for _, id := range projectIDs {
-		root := cfg.Projects[id].Path
-		targets = append(targets,
-			target{
-				path: filepath.Join(root, ".codex", "config.toml"), agent: config.AgentCodex,
-				scope: id, projectID: id, key: "mcp_servers", format: formatTOML,
-			},
-			target{
-				path: filepath.Join(root, ".mcp.json"), agent: config.AgentClaude,
-				scope: id, projectID: id, key: "mcpServers", format: formatJSON,
-			},
-			target{
-				path: filepath.Join(root, "opencode.json"), agent: config.AgentOpenCode,
-				scope: id, projectID: id, key: "mcp", format: formatJSON,
-			},
-		)
+		project := cfg.Projects[id]
+		roots := []string{project.Path}
+		if project.IncludeWorktrees {
+			worktrees, err := discoverWorktrees(project.Path)
+			if err != nil {
+				return nil, fmt.Errorf("discover worktrees for project %q: %w", id, err)
+			}
+			for _, root := range worktrees {
+				// An explicitly registered path always uses its own scope.
+				if explicitRoots[root] {
+					continue
+				}
+				if previous, exists := discoveredOwners[root]; exists {
+					return nil, fmt.Errorf("worktree %q is discovered by projects %q and %q; register it explicitly or enable discovery for only one project in this repository", root, previous, id)
+				}
+				discoveredOwners[root] = id
+				roots = append(roots, root)
+			}
+		}
+		for _, root := range roots {
+			targets = append(targets,
+				target{
+					path: filepath.Join(root, ".codex", "config.toml"), agent: config.AgentCodex,
+					scope: id, projectID: id, key: "mcp_servers", format: formatTOML,
+				},
+				target{
+					path: filepath.Join(root, ".mcp.json"), agent: config.AgentClaude,
+					scope: id, projectID: id, key: "mcpServers", format: formatJSON,
+				},
+				target{
+					path: filepath.Join(root, "opencode.json"), agent: config.AgentOpenCode,
+					scope: id, projectID: id, key: "mcp", format: formatJSON,
+				},
+			)
+		}
 	}
-	return targets
+	return targets, nil
 }
 
 func rejectTargetCollisions(targets []target) error {

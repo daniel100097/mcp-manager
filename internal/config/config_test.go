@@ -79,6 +79,100 @@ func TestParseValidV2Config(t *testing.T) {
 	}
 }
 
+func TestParseIncludeWorktrees(t *testing.T) {
+	home := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		field   string
+		want    bool
+		invalid bool
+	}{
+		{name: "default"},
+		{name: "enabled", field: `,"includeWorktrees":true`, want: true},
+		{name: "disabled", field: `,"includeWorktrees":false`},
+		{name: "null", field: `,"includeWorktrees":null`, invalid: true},
+		{name: "string", field: `,"includeWorktrees":"true"`, invalid: true},
+		{name: "number", field: `,"includeWorktrees":1`, invalid: true},
+		{name: "object", field: `,"includeWorktrees":{}`, invalid: true},
+		{name: "array", field: `,"includeWorktrees":[]`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{"version":2,"global":{"mcps":[]},"projects":{"api":{"path":"~","mcps":[]` + tc.field + `}},"mcps":{}}`)
+			cfg, err := Parse(data, home)
+			if tc.invalid {
+				if err == nil || !strings.Contains(err.Error(), `field "includeWorktrees" must be a boolean`) {
+					t.Fatalf("Parse() error = %v, want boolean validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Projects["api"].IncludeWorktrees != tc.want {
+				t.Fatalf("IncludeWorktrees = %v, want %v", cfg.Projects["api"].IncludeWorktrees, tc.want)
+			}
+		})
+	}
+}
+
+func TestIncludeWorktreesLocalOverridesSurviveEdits(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		centralField string
+		localField   string
+		want         bool
+	}{
+		{name: "enable locally", localField: "true", want: true},
+		{name: "disable locally", centralField: `,"includeWorktrees":true`, localField: "false"},
+		{name: "pin default false", localField: "false"},
+		{name: "pin explicit false", centralField: `,"includeWorktrees":false`, localField: "false"},
+		{name: "pin true", centralField: `,"includeWorktrees":true`, localField: "true", want: true},
+		{name: "remove setting", centralField: `,"includeWorktrees":true`, localField: "null"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			central := filepath.Join(base, "config.json")
+			local := LocalPathFor(central)
+			writeTestFile(t, central, `{"version":2,"global":{"mcps":[]},"projects":{"api":{"path":`+jsonString(t, base)+`,"mcps":[]`+tc.centralField+`}},"mcps":{"tool":{"type":"stdio","command":"tool"}}}`)
+			writeTestFile(t, local, `{"projects":{"api":{"includeWorktrees":`+tc.localField+`}}}`)
+			before := readTestFile(t, central)
+			source := Source{Path: central, LocalPath: local}
+			edit, err := source.OpenEdit()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if edit.Config.Projects["api"].IncludeWorktrees != tc.want {
+				t.Fatalf("editable IncludeWorktrees = %v, want %v", edit.Config.Projects["api"].IncludeWorktrees, tc.want)
+			}
+			project := edit.Config.Projects["api"]
+			project.MCPs = []string{"tool"}
+			edit.Config.Projects["api"] = project
+			if err := edit.Save(); err != nil {
+				t.Fatal(err)
+			}
+			if after := readTestFile(t, central); after != before {
+				t.Fatal("Save changed central config")
+			}
+			var patch struct {
+				Projects map[string]map[string]json.RawMessage `json:"projects"`
+			}
+			if err := json.Unmarshal([]byte(readTestFile(t, local)), &patch); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(patch.Projects["api"]["includeWorktrees"]); got != tc.localField && tc.localField != "null" {
+				t.Fatalf("saved override = %q, want %q", got, tc.localField)
+			}
+			reloaded, err := source.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reloaded.Projects["api"].IncludeWorktrees != tc.want {
+				t.Fatalf("reloaded IncludeWorktrees = %v, want %v", reloaded.Projects["api"].IncludeWorktrees, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseMigratesV1InMemory(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := filepath.Join(home, "projects", "demo")

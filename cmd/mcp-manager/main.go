@@ -40,6 +40,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runScopeCommand(args[1:], stdout, stderr, disableCommand)
 	case "move":
 		return runScopeCommand(args[1:], stdout, stderr, moveCommand)
+	case "worktrees":
+		return runWorktrees(args[1:], stdout, stderr)
 	case "stdio":
 		return runStdio(args[1:], stderr)
 	case "version", "--version", "-version":
@@ -573,6 +575,8 @@ Usage:
   mcp-manager enable [--config PATH] [--dry-run] MCP PROJECT
   mcp-manager disable [--config PATH] [--dry-run] MCP PROJECT
   mcp-manager move [--config PATH] [--dry-run] MCP PROJECT
+  mcp-manager worktrees enable [--config PATH] [--dry-run] PROJECT
+  mcp-manager worktrees disable [--config PATH] [--dry-run] PROJECT
   mcp-manager stdio [--config PATH] MCP
   mcp-manager version
   mcp-manager help
@@ -580,7 +584,7 @@ Usage:
 Every command also accepts --config-local PATH to select the local override
 file, which defaults to the --config path with a .local.json suffix. When that
 file exists, it is applied on top of the central config and receives the
-changes made by import, enable, disable, and move.
+changes made by import, enable, disable, move, and worktrees.
 
 Generated agent configs launch stdio MCPs through "mcp-manager stdio MCP", so
 the mcp-manager binary must be on the PATH that Codex, Claude Code, and

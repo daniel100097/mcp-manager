@@ -140,9 +140,10 @@ another machine as long as the local file corrects or removes them here. That
 keeps the central file shareable, for example in a dotfiles repository.
 
 When the local file exists, it also receives every change made by `import`,
-`enable`, `disable`, and `move`, and the central config is left untouched as
-the shared defaults. `mcp-manager` rewrites the local file as the patch that
-turns the central config into the edited result, keeping entries that still
+`enable`, `disable`, `move`, and `worktrees enable`/`worktrees disable`. The
+central config is left untouched as the shared defaults. `mcp-manager` rewrites
+the local file as the patch that turns the central config into the edited result,
+keeping entries that still
 match the central values so that a deliberate pin survives. Create a local
 file containing `{}` to start recording changes locally. Without a local
 file, those commands write to the central config.
@@ -152,6 +153,38 @@ not the default sibling of the central config, so `mcp-manager stdio` applies
 the same overrides at launch. The local file has no JSON Schema because it
 describes a partial document; do not point its `$schema` at
 `mcp-manager.schema.json`.
+
+## Git worktrees
+
+Worktree discovery is disabled by default and enabled separately for each
+registered project path:
+
+```bash
+mcp-manager worktrees enable api
+mcp-manager worktrees enable --dry-run api
+mcp-manager worktrees disable api
+```
+
+These commands set `projects.api.includeWorktrees` to `true` or `false` and
+immediately sync. They accept `--config PATH`, `--config-local PATH`, and
+`--dry-run`; dry runs preview configuration and generated-file changes without
+writing. When a local override file exists, the setting is saved there.
+You can also edit `includeWorktrees` in JSON and run `mcp-manager sync`.
+
+An enabled project's `path` must be a Git repository or worktree root. During
+each sync, `git worktree list --porcelain -z` discovers its worktrees, which
+inherit the project's `mcps` and `disabledAgents`. Bare entries and missing or
+prunable worktree entries are skipped. A worktree registered as its
+own project uses that project's settings. If multiple enabled projects would
+supply settings to the same unregistered worktree, sync fails; enable discovery
+for one project in that repository. Invalid enabled paths or Git failures also
+stop sync before any generated files are written.
+
+Run sync after creating a worktree and before starting the agent; discovery
+does not watch for new worktrees. Disabling discovery stops syncing inherited
+worktrees but does not delete their previously generated files. MCP commands,
+arguments, and environment values are inherited unchanged, including any
+absolute paths in server definitions.
 
 ## Launching stdio servers through mcp-manager
 

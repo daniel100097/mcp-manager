@@ -138,6 +138,11 @@
           "minLength": 1,
           "description": "Existing absolute project directory; a leading ~/ is also supported."
         },
+        "includeWorktrees": {
+          "type": "boolean",
+          "default": false,
+          "description": "Discover this repository's worktrees during sync and inherit this project's MCPs and agent exclusions. Requires path to be a Git repository or worktree root."
+        },
         "mcps": {
           "$ref": "#/$defs/mcpNames"
         },

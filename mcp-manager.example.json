@@ -18,6 +18,7 @@
   "projects": {
     "mcp-manager": {
       "path": "/home/me/code/mcp-manager",
+      "includeWorktrees": false,
       "mcps": [
         "workspace-files",
         "team-api"

@@ -68,9 +68,10 @@ type Scope struct {
 }
 
 type Project struct {
-	Path           string             `json:"path"`
-	MCPs           []string           `json:"mcps"`
-	DisabledAgents map[string][]Agent `json:"disabledAgents,omitempty"`
+	Path             string             `json:"path"`
+	IncludeWorktrees bool               `json:"includeWorktrees,omitempty"`
+	MCPs             []string           `json:"mcps"`
+	DisabledAgents   map[string][]Agent `json:"disabledAgents,omitempty"`
 }
 
 type MCP struct {
@@ -292,6 +293,10 @@ func localPatchFor(central []byte, previous any, edited []byte) (map[string]any,
 	if err := decodeAny(edited, &target); err != nil {
 		return nil, err
 	}
+	// Materialize the default for patch comparison so explicit false overrides
+	// and pins survive omitempty when editing an unrelated setting.
+	materializeWorktreeDefaults(base)
+	materializeWorktreeDefaults(target)
 
 	patch := map[string]any{}
 	if required, changed := diffValues(base, target); changed {
@@ -304,6 +309,20 @@ func localPatchFor(central []byte, previous any, edited []byte) (map[string]any,
 		return nil, errors.New("internal error: local config patch does not reproduce the edited config")
 	}
 	return patch, nil
+}
+
+func materializeWorktreeDefaults(value any) {
+	root, _ := value.(map[string]any)
+	projects, _ := root["projects"].(map[string]any)
+	for _, value := range projects {
+		project, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := project["includeWorktrees"]; !exists {
+			project["includeWorktrees"] = false
+		}
+	}
 }
 
 // diffValues returns the JSON merge patch that turns source into target and
@@ -1072,6 +1091,12 @@ func validateRequiredFieldsV2(data []byte) error {
 		}
 		if firstJSONByte(project["path"]) != '"' {
 			return fmt.Errorf("%s field %q must be a string", label, "path")
+		}
+		if raw, exists := project["includeWorktrees"]; exists {
+			trimmed := bytes.TrimSpace(raw)
+			if !bytes.Equal(trimmed, []byte("true")) && !bytes.Equal(trimmed, []byte("false")) {
+				return fmt.Errorf("%s field %q must be a boolean", label, "includeWorktrees")
+			}
 		}
 		if err := validateRequiredScopeFields(label, project); err != nil {
 			return err
