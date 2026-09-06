@@ -35,11 +35,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "import":
 		return runImport(args[1:], stdout, stderr)
 	case "enable":
-		return runEnable(args[1:], stdout, stderr)
+		return runScopeCommand(args[1:], stdout, stderr, enableCommand)
 	case "disable":
-		return runDisable(args[1:], stdout, stderr)
+		return runScopeCommand(args[1:], stdout, stderr, disableCommand)
 	case "move":
-		return runMove(args[1:], stdout, stderr)
+		return runScopeCommand(args[1:], stdout, stderr, moveCommand)
 	case "stdio":
 		return runStdio(args[1:], stderr)
 	case "version", "--version", "-version":
@@ -55,6 +55,35 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+// configFlags holds the --config and --config-local options that every
+// subcommand accepts.
+type configFlags struct {
+	path  *string
+	local *string
+}
+
+func addConfigFlags(flags *flag.FlagSet, defaultConfig string) configFlags {
+	return configFlags{
+		path: flags.String("config", defaultConfig, "path to the central JSON config"),
+		local: flags.String(
+			"config-local", "",
+			"path to the local override config; defaults to MCP_MANAGER_CONFIG_LOCAL or the --config path with a .local.json suffix",
+		),
+	}
+}
+
+// source resolves the parsed flags into the central config and its overlay.
+func (f configFlags) source() (config.Source, error) {
+	local := *f.local
+	if local == "" {
+		var err error
+		if local, err = syncer.DefaultLocalConfigPath(*f.path); err != nil {
+			return config.Source{}, err
+		}
+	}
+	return config.Source{Path: *f.path, LocalPath: local}, nil
+}
+
 // runStdio launches the named stdio MCP from the central config. It never
 // writes to stdout because that stream carries the MCP protocol once the
 // server starts.
@@ -67,7 +96,7 @@ func runStdio(args []string, stderr io.Writer) int {
 
 	flags := flag.NewFlagSet("stdio", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfig, "path to the central JSON config")
+	configFlags := addConfigFlags(flags, defaultConfig)
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: mcp-manager stdio [options] MCP\n\nOptions:\n")
 		printLongFlagDefaults(stderr, flags)
@@ -86,7 +115,12 @@ func runStdio(args []string, stderr io.Writer) int {
 	}
 
 	mcpName := flags.Arg(0)
-	cfg, err := config.Load(*configPath)
+	source, err := configFlags.source()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	cfg, err := source.Load()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
@@ -104,19 +138,57 @@ func runStdio(args []string, stderr io.Writer) int {
 	return code
 }
 
-func runDisable(args []string, stdout, stderr io.Writer) int {
+// scopeCommand describes one activation change shared by enable, disable,
+// and move: the mutation and the messages that report its outcome. Every
+// message takes the MCP name and the project ID.
+type scopeCommand struct {
+	name      string
+	apply     func(cfg *config.Config, mcpName, projectID string) (bool, error)
+	unchanged string
+	preview   string
+	done      string
+}
+
+var (
+	enableCommand = scopeCommand{
+		name:      "enable",
+		apply:     enableMCP,
+		unchanged: "MCP %q is already enabled for project %q",
+		preview:   "would enable MCP %q for project %q",
+		done:      "enabled MCP %q for project %q",
+	}
+	disableCommand = scopeCommand{
+		name:      "disable",
+		apply:     disableMCP,
+		unchanged: "MCP %q is already disabled for project %q",
+		preview:   "would disable MCP %q for project %q",
+		done:      "disabled MCP %q for project %q",
+	}
+	moveCommand = scopeCommand{
+		name:      "move",
+		apply:     moveMCP,
+		unchanged: "MCP %q is already local to project %q",
+		preview:   "would move MCP %q from global scope to project %q",
+		done:      "moved MCP %q from global scope to project %q",
+	}
+)
+
+// runScopeCommand applies an activation change and synchronizes the generated
+// outputs. The change is written to the local override config when that file
+// exists and to the central config otherwise.
+func runScopeCommand(args []string, stdout, stderr io.Writer, command scopeCommand) int {
 	defaultConfig, err := syncer.DefaultConfigPath()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 
-	flags := flag.NewFlagSet("disable", flag.ContinueOnError)
+	flags := flag.NewFlagSet(command.name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfig, "path to the central JSON config")
+	configFlags := addConfigFlags(flags, defaultConfig)
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
 	flags.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: mcp-manager disable [options] MCP PROJECT\n\nOptions:\n")
+		fmt.Fprintf(stderr, "Usage: mcp-manager %s [options] MCP PROJECT\n\nOptions:\n", command.name)
 		printLongFlagDefaults(stderr, flags)
 	}
 	if err := flags.Parse(args); err != nil {
@@ -126,42 +198,50 @@ func runDisable(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 2 {
-		fmt.Fprintln(stderr, "error: disable requires an MCP name and a project ID")
-		fmt.Fprintln(stderr)
+		fmt.Fprintf(stderr, "error: %s requires an MCP name and a project ID\n\n", command.name)
 		flags.Usage()
 		return 2
 	}
 
 	mcpName := flags.Arg(0)
 	projectID := flags.Arg(1)
-	cfg, err := config.Load(*configPath)
+	source, err := configFlags.source()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	changed, err := disableMCP(cfg, mcpName, projectID)
+	edit, err := source.OpenEdit()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	changed, err := command.apply(edit.Config, mcpName, projectID)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	// Validate the complete result before anything is written.
+	effective, err := edit.Effective()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 
-	if !changed {
-		fmt.Fprintf(stdout, "MCP %q is already disabled for project %q; central config unchanged\n", mcpName, projectID)
-		return syncConfig(cfg, *configPath, false, *dryRun, stdout, stderr)
+	switch {
+	case !changed:
+		fmt.Fprintf(stdout, command.unchanged+"; %s unchanged\n", mcpName, projectID, edit.Label())
+	case *dryRun:
+		fmt.Fprintf(stdout, command.preview+"\n", mcpName, projectID)
+		fmt.Fprintf(stdout, "dry run complete: %s would change: %s\n", edit.Label(), edit.Target())
+	default:
+		if err := edit.Save(); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, command.done+"\n", mcpName, projectID)
+		fmt.Fprintf(stdout, "%s updated: %s\n", edit.Label(), edit.Target())
 	}
-	if *dryRun {
-		fmt.Fprintf(stdout, "would disable MCP %q for project %q\n", mcpName, projectID)
-		fmt.Fprintf(stdout, "dry run complete: central config would change: %s\n", *configPath)
-		return syncConfig(cfg, *configPath, false, true, stdout, stderr)
-	}
-	if err := config.Save(*configPath, cfg); err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	fmt.Fprintf(stdout, "disabled MCP %q for project %q\n", mcpName, projectID)
-	fmt.Fprintf(stdout, "central config updated: %s\n", *configPath)
-	return syncConfig(cfg, *configPath, false, false, stdout, stderr)
+	return syncConfig(effective, source, false, *dryRun, stdout, stderr)
 }
 
 func disableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
@@ -190,66 +270,6 @@ func disableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	return true, nil
 }
 
-func runEnable(args []string, stdout, stderr io.Writer) int {
-	defaultConfig, err := syncer.DefaultConfigPath()
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	flags := flag.NewFlagSet("enable", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfig, "path to the central JSON config")
-	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
-	flags.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: mcp-manager enable [options] MCP PROJECT\n\nOptions:\n")
-		printLongFlagDefaults(stderr, flags)
-	}
-	if err := flags.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
-	}
-	if flags.NArg() != 2 {
-		fmt.Fprintln(stderr, "error: enable requires an MCP name and a project ID")
-		fmt.Fprintln(stderr)
-		flags.Usage()
-		return 2
-	}
-
-	mcpName := flags.Arg(0)
-	projectID := flags.Arg(1)
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-	changed, err := enableMCP(cfg, mcpName, projectID)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	if !changed {
-		fmt.Fprintf(stdout, "MCP %q is already enabled for project %q; central config unchanged\n", mcpName, projectID)
-		return syncConfig(cfg, *configPath, false, *dryRun, stdout, stderr)
-	}
-	if *dryRun {
-		fmt.Fprintf(stdout, "would enable MCP %q for project %q\n", mcpName, projectID)
-		fmt.Fprintf(stdout, "dry run complete: central config would change: %s\n", *configPath)
-		return syncConfig(cfg, *configPath, false, true, stdout, stderr)
-	}
-	if err := config.Save(*configPath, cfg); err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	fmt.Fprintf(stdout, "enabled MCP %q for project %q\n", mcpName, projectID)
-	fmt.Fprintf(stdout, "central config updated: %s\n", *configPath)
-	return syncConfig(cfg, *configPath, false, false, stdout, stderr)
-}
-
 func enableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	if cfg == nil {
 		return false, errors.New("config must not be nil")
@@ -271,66 +291,6 @@ func enableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	project.MCPs = append(project.MCPs, mcpName)
 	cfg.Projects[projectID] = project
 	return true, nil
-}
-
-func runMove(args []string, stdout, stderr io.Writer) int {
-	defaultConfig, err := syncer.DefaultConfigPath()
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	flags := flag.NewFlagSet("move", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfig, "path to the central JSON config")
-	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
-	flags.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: mcp-manager move [options] MCP PROJECT\n\nOptions:\n")
-		printLongFlagDefaults(stderr, flags)
-	}
-	if err := flags.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
-	}
-	if flags.NArg() != 2 {
-		fmt.Fprintln(stderr, "error: move requires an MCP name and a project ID")
-		fmt.Fprintln(stderr)
-		flags.Usage()
-		return 2
-	}
-
-	mcpName := flags.Arg(0)
-	projectID := flags.Arg(1)
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-	changed, err := moveMCP(cfg, mcpName, projectID)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	if !changed {
-		fmt.Fprintf(stdout, "MCP %q is already local to project %q; central config unchanged\n", mcpName, projectID)
-		return syncConfig(cfg, *configPath, false, *dryRun, stdout, stderr)
-	}
-	if *dryRun {
-		fmt.Fprintf(stdout, "would move MCP %q from global scope to project %q\n", mcpName, projectID)
-		fmt.Fprintf(stdout, "dry run complete: central config would change: %s\n", *configPath)
-		return syncConfig(cfg, *configPath, false, true, stdout, stderr)
-	}
-	if err := config.Save(*configPath, cfg); err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	fmt.Fprintf(stdout, "moved MCP %q from global scope to project %q\n", mcpName, projectID)
-	fmt.Fprintf(stdout, "central config updated: %s\n", *configPath)
-	return syncConfig(cfg, *configPath, false, false, stdout, stderr)
 }
 
 func moveMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
@@ -390,7 +350,7 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 
 	flags := flag.NewFlagSet("import", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfig, "path to the central JSON config")
+	configFlags := addConfigFlags(flags, defaultConfig)
 	from := flags.String("from", "", "source agent: codex, claude, or opencode (required)")
 	project := flags.String("project", "", "project scope as ID=/absolute/path")
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
@@ -416,11 +376,16 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	existing, err := config.Load(*configPath)
+	source, err := configFlags.source()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	edit, err := source.OpenEdit()
 	centralExists := true
 	if errors.Is(err, os.ErrNotExist) {
 		centralExists = false
-		existing = &config.Config{
+		edit = source.NewEdit(&config.Config{
 			Version: config.CurrentVersion,
 			Global: config.Scope{
 				MCPs:           []string{},
@@ -428,7 +393,7 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 			},
 			Projects: map[string]config.Project{},
 			MCPs:     map[string]config.MCP{},
-		}
+		})
 	} else if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
@@ -450,14 +415,21 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 		options.ProjectPath = path
 	}
 
-	merged, result, err := importer.Import(existing, options)
+	merged, result, err := importer.Import(edit.Config, options)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	edit.Config = merged
 	changed := !centralExists || result.Added > 0 || result.Activated > 0 || result.ProjectRegistered
+	// Validate the complete result before anything is written.
+	effective, err := edit.Effective()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
 	if changed && !*dryRun {
-		if err := config.Save(*configPath, merged); err != nil {
+		if err := edit.Save(); err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
@@ -474,13 +446,13 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 		result.Added, result.Activated, result.Unchanged, result.Skipped, result.SourcePath,
 	)
 	if !changed {
-		fmt.Fprintln(stdout, "central config already contains these MCPs")
+		fmt.Fprintf(stdout, "%s already contains these MCPs\n", edit.Label())
 	} else if *dryRun {
-		fmt.Fprintf(stdout, "dry run complete: central config would change: %s\n", *configPath)
+		fmt.Fprintf(stdout, "dry run complete: %s would change: %s\n", edit.Label(), edit.Target())
 	} else {
-		fmt.Fprintf(stdout, "central config updated: %s\n", *configPath)
+		fmt.Fprintf(stdout, "%s updated: %s\n", edit.Label(), edit.Target())
 	}
-	return syncConfig(merged, *configPath, false, *dryRun, stdout, stderr)
+	return syncConfig(effective, source, false, *dryRun, stdout, stderr)
 }
 
 func parseAgent(value string) (config.Agent, error) {
@@ -502,7 +474,7 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 
 	flags := flag.NewFlagSet("sync", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfig, "path to the central JSON config")
+	configFlags := addConfigFlags(flags, defaultConfig)
 	inlineSecrets := flags.Bool("inline-secrets", false, "resolve env references and store their values inline")
 	dryRun := flags.Bool("dry-run", false, "validate and show changes without writing files")
 	flags.Usage = func() {
@@ -521,21 +493,27 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	cfg, err := config.Load(*configPath)
+	source, err := configFlags.source()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	return syncConfig(cfg, *configPath, *inlineSecrets, *dryRun, stdout, stderr)
+	cfg, err := source.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	return syncConfig(cfg, source, *inlineSecrets, *dryRun, stdout, stderr)
 }
 
-func syncConfig(cfg *config.Config, configPath string, inlineSecrets, dryRun bool, stdout, stderr io.Writer) int {
+func syncConfig(cfg *config.Config, source config.Source, inlineSecrets, dryRun bool, stdout, stderr io.Writer) int {
 	options, err := syncer.DefaultOptions()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	options.ConfigPath = configPath
+	options.ConfigPath = source.Path
+	options.LocalConfigPath = source.LocalPath
 	options.InlineSecrets = cfg.Options.InlineSecrets || inlineSecrets
 	options.DryRun = dryRun
 	if options.InlineSecrets {
@@ -568,9 +546,10 @@ func syncConfig(cfg *config.Config, configPath string, inlineSecrets, dryRun boo
 
 func printLongFlagDefaults(output io.Writer, flags *flag.FlagSet) {
 	placeholders := map[string]string{
-		"config":  "PATH",
-		"from":    "AGENT",
-		"project": "ID=PATH",
+		"config":       "PATH",
+		"config-local": "PATH",
+		"from":         "AGENT",
+		"project":      "ID=PATH",
 	}
 	flags.VisitAll(func(option *flag.Flag) {
 		argument := ""
@@ -597,6 +576,11 @@ Usage:
   mcp-manager stdio [--config PATH] MCP
   mcp-manager version
   mcp-manager help
+
+Every command also accepts --config-local PATH to select the local override
+file, which defaults to the --config path with a .local.json suffix. When that
+file exists, it is applied on top of the central config and receives the
+changes made by import, enable, disable, and move.
 
 Generated agent configs launch stdio MCPs through "mcp-manager stdio MCP", so
 the mcp-manager binary must be on the PATH that Codex, Claude Code, and

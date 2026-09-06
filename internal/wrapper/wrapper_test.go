@@ -38,15 +38,21 @@ func TestArgsAndParseRoundTrip(t *testing.T) {
 	tests := []struct {
 		name       string
 		configPath string
+		localPath  string
 		want       []string
 	}{
 		{name: "tools", want: []string{"stdio", "tools"}},
 		{name: "tools", configPath: "/central/config.json", want: []string{"stdio", "--config", "/central/config.json", "tools"}},
+		{name: "tools", localPath: "/central/overrides.json", want: []string{"stdio", "--config-local", "/central/overrides.json", "tools"}},
+		{
+			name: "tools", configPath: "/central/config.json", localPath: "/central/overrides.json",
+			want: []string{"stdio", "--config", "/central/config.json", "--config-local", "/central/overrides.json", "tools"},
+		},
 	}
 	for _, test := range tests {
-		got := Args(test.name, test.configPath)
+		got := Args(test.name, test.configPath, test.localPath)
 		if !reflect.DeepEqual(got, test.want) {
-			t.Fatalf("Args(%q, %q) = %#v, want %#v", test.name, test.configPath, got, test.want)
+			t.Fatalf("Args(%q, %q, %q) = %#v, want %#v", test.name, test.configPath, test.localPath, got, test.want)
 		}
 		for _, command := range []string{Command, "/usr/local/bin/mcp-manager", `C:\Tools\mcp-manager.exe`} {
 			name, ok := Parse(command, got)
@@ -55,8 +61,14 @@ func TestArgsAndParseRoundTrip(t *testing.T) {
 			}
 		}
 	}
-	if name, ok := Parse(Command, []string{"stdio", "--config=/central/config.json", "tools"}); !ok || name != "tools" {
-		t.Fatalf("Parse(--config=) = %q, %v; want tools, true", name, ok)
+	inlineForms := [][]string{
+		{"stdio", "--config=/central/config.json", "tools"},
+		{"stdio", "--config-local=/central/overrides.json", "-config", "/central/config.json", "tools"},
+	}
+	for _, args := range inlineForms {
+		if name, ok := Parse(Command, args); !ok || name != "tools" {
+			t.Fatalf("Parse(%#v) = %q, %v; want tools, true", args, name, ok)
+		}
 	}
 }
 
@@ -72,6 +84,9 @@ func TestParseRejectsForeignCommandLines(t *testing.T) {
 		{command: Command, args: []string{"stdio"}},
 		{command: Command, args: []string{"stdio", "--config"}},
 		{command: Command, args: []string{"stdio", "--config", "/path"}},
+		{command: Command, args: []string{"stdio", "--config-local"}},
+		{command: Command, args: []string{"stdio", "--config-local", "/path"}},
+		{command: Command, args: []string{"stdio", "--config", "/path", "--verbose", "tools"}},
 		{command: Command, args: []string{"stdio", "tools", "extra"}},
 		{command: Command, args: []string{"stdio", "--dry-run", "tools"}},
 	}

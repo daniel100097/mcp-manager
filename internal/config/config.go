@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -98,16 +99,477 @@ type mcpV1 struct {
 	DisabledAgents []Agent  `json:"disabledAgents,omitempty"`
 }
 
+// Source names the central config file and its optional local overlay.
+type Source struct {
+	// Path is the central config.
+	Path string
+	// LocalPath is the overlay applied on top of the central config as a JSON
+	// merge patch. An empty value disables layering; a missing file is not an
+	// error, so the overlay is purely optional.
+	LocalPath string
+}
+
+// LocalPathFor returns the default overlay location for a central config: the
+// same file name with ".local" inserted before the extension, so config.json
+// pairs with config.local.json.
+func LocalPathFor(path string) string {
+	ext := filepath.Ext(path)
+	if ext == "" {
+		return path + ".local.json"
+	}
+	return strings.TrimSuffix(path, ext) + ".local" + ext
+}
+
+// Load reads and validates a central config without a local overlay.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	return Source{Path: path}.Load()
+}
+
+// Load returns the effective config: the central file with the local overlay
+// applied, migrated to the current version, and fully validated, including
+// the project directory checks.
+func (s Source) Load() (*Config, error) {
+	data, err := readCentralV2(s.Path)
 	if err != nil {
-		return nil, fmt.Errorf("read central config %q: %w", path, err)
+		return nil, err
+	}
+	return s.overlay(data)
+}
+
+// Edit is a config opened for modification. When the local overlay file
+// exists, Config is the central config with the overlay applied and Save
+// writes the resulting changes back to the overlay only, keeping the central
+// file as shared defaults. Otherwise Config is the central config and Save
+// writes it. In both cases project paths stay exactly as written.
+type Edit struct {
+	source Source
+	// central is the canonical version 2 form of the central file, or nil
+	// when the central file does not exist yet.
+	central []byte
+	// local is the decoded overlay when Save writes to it.
+	local      any
+	writeLocal bool
+	// Config is the configuration to modify.
+	Config *Config
+}
+
+// OpenEdit reads the central config and, when present, the local overlay,
+// for modification. Structural and semantic checks run, but project paths are
+// neither resolved nor required to exist, so a shared central config stays
+// editable on machines where the overlay supplies the real paths.
+func (s Source) OpenEdit() (*Edit, error) {
+	central, err := readCentralV2(s.Path)
+	if err != nil {
+		return nil, err
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("find home directory: %w", err)
 	}
-	return Parse(data, home)
+	patch, present, err := readLocalPatch(s.LocalPath)
+	if err != nil {
+		return nil, err
+	}
+	data := central
+	if present {
+		if data, err = applyLocalPatch(central, patch, s.LocalPath); err != nil {
+			return nil, err
+		}
+	}
+	var cfg Config
+	if err := decodeStrict(data, &cfg); err != nil {
+		return nil, fmt.Errorf("invalid central config: %w", err)
+	}
+	cfg.normalizeCollections()
+	if err := cfg.validateStatic(home); err != nil {
+		if present {
+			return nil, fmt.Errorf("with local config %q applied: %w", s.LocalPath, err)
+		}
+		return nil, err
+	}
+	edit := &Edit{source: s, central: central, writeLocal: present, Config: &cfg}
+	if present {
+		if err := decodeAny(patch, &edit.local); err != nil {
+			return nil, fmt.Errorf("invalid local config %q: %w", s.LocalPath, err)
+		}
+	}
+	return edit, nil
+}
+
+// NewEdit prepares a central config that does not exist on disk yet. Save
+// writes it to the central file; the local overlay, if any, still applies to
+// the effective config.
+func (s Source) NewEdit(cfg *Config) *Edit {
+	return &Edit{source: s, Config: cfg}
+}
+
+// WritesLocal reports whether Save writes to the local overlay instead of the
+// central config.
+func (e *Edit) WritesLocal() bool {
+	return e.writeLocal
+}
+
+// Target returns the file that Save writes.
+func (e *Edit) Target() string {
+	if e.writeLocal {
+		return e.source.LocalPath
+	}
+	return e.source.Path
+}
+
+// Label names the file that Save writes, for messages.
+func (e *Edit) Label() string {
+	if e.writeLocal {
+		return "local config"
+	}
+	return "central config"
+}
+
+// Effective fully validates the current state of Config, including project
+// directories, and returns the effective config that sync should apply.
+// Config itself is left unchanged.
+func (e *Edit) Effective() (*Config, error) {
+	if !e.writeLocal {
+		return e.source.Overlay(e.Config)
+	}
+	data, err := json.Marshal(e.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("find home directory: %w", err)
+	}
+	cfg, err := parseV2(data, home)
+	if err != nil {
+		return nil, fmt.Errorf("with local config %q applied: %w", e.source.LocalPath, err)
+	}
+	return cfg, nil
+}
+
+// Save writes the changes made to Config. With a local overlay present, it
+// rewrites the overlay as the merge patch that turns the central config into
+// Config, preserving overlay entries that still have no effect (such as a
+// value pinned to its central default). Without an overlay it writes the
+// central file.
+func (e *Edit) Save() error {
+	if e.Config == nil {
+		return errors.New("config must not be nil")
+	}
+	if !e.writeLocal {
+		return Save(e.source.Path, e.Config)
+	}
+	e.Config.Version = CurrentVersion
+	e.Config.normalizeCollections()
+	edited, err := json.Marshal(e.Config)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	patch, err := localPatchFor(e.central, e.local, edited)
+	if err != nil {
+		return err
+	}
+	return writeJSONFile(e.source.LocalPath, patch, "local config")
+}
+
+// localPatchFor returns the overlay that reproduces edited when applied to
+// central. It starts from the minimal merge patch and re-adds entries of the
+// previous overlay that remain no-ops, then verifies the result.
+func localPatchFor(central []byte, previous any, edited []byte) (map[string]any, error) {
+	var centralConfig Config
+	if err := decodeStrict(central, &centralConfig); err != nil {
+		return nil, fmt.Errorf("invalid central config: %w", err)
+	}
+	centralConfig.normalizeCollections()
+	canonical, err := json.Marshal(&centralConfig)
+	if err != nil {
+		return nil, fmt.Errorf("encode central config: %w", err)
+	}
+	var base, target any
+	if err := decodeAny(canonical, &base); err != nil {
+		return nil, err
+	}
+	if err := decodeAny(edited, &target); err != nil {
+		return nil, err
+	}
+
+	patch := map[string]any{}
+	if required, changed := diffValues(base, target); changed {
+		patch = required.(map[string]any)
+	}
+	if old, ok := previous.(map[string]any); ok {
+		preserveRedundant(patch, old, base, target)
+	}
+	if !reflect.DeepEqual(mergeValues(deepCopy(base), patch), target) {
+		return nil, errors.New("internal error: local config patch does not reproduce the edited config")
+	}
+	return patch, nil
+}
+
+// diffValues returns the JSON merge patch that turns source into target and
+// whether the two differ at all.
+func diffValues(source, target any) (any, bool) {
+	sourceObject, sourceIsObject := source.(map[string]any)
+	targetObject, targetIsObject := target.(map[string]any)
+	if !sourceIsObject || !targetIsObject {
+		if reflect.DeepEqual(source, target) {
+			return nil, false
+		}
+		return target, true
+	}
+	patch := map[string]any{}
+	for key, targetValue := range targetObject {
+		sourceValue, exists := sourceObject[key]
+		if !exists {
+			patch[key] = targetValue
+			continue
+		}
+		if sub, changed := diffValues(sourceValue, targetValue); changed {
+			patch[key] = sub
+		}
+	}
+	for key := range sourceObject {
+		if _, exists := targetObject[key]; !exists {
+			patch[key] = nil
+		}
+	}
+	if len(patch) == 0 {
+		return nil, false
+	}
+	return patch, true
+}
+
+// preserveRedundant copies entries from the previous overlay into patch when
+// they are absent from patch and applying them to central still yields
+// target, so that deliberate pins survive an edit. patch stays a valid patch
+// for target because only verified no-ops are added.
+func preserveRedundant(patch, previous map[string]any, central, target any) {
+	centralObject, _ := central.(map[string]any)
+	targetObject, _ := target.(map[string]any)
+	for key, oldValue := range previous {
+		if existing, exists := patch[key]; exists {
+			existingObject, existingIsObject := existing.(map[string]any)
+			oldObject, oldIsObject := oldValue.(map[string]any)
+			if existingIsObject && oldIsObject {
+				preserveRedundant(existingObject, oldObject, centralObject[key], targetObject[key])
+			}
+			continue
+		}
+		targetValue, inTarget := targetObject[key]
+		if oldValue == nil {
+			if !inTarget {
+				patch[key] = nil
+			}
+			continue
+		}
+		if inTarget && reflect.DeepEqual(mergeValues(deepCopy(centralObject[key]), oldValue), targetValue) {
+			patch[key] = oldValue
+		}
+	}
+}
+
+func deepCopy(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, entry := range typed {
+			result[key] = deepCopy(entry)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, entry := range typed {
+			result[index] = deepCopy(entry)
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+// Overlay applies the local overlay to an in-memory central config and
+// returns the validated effective config. central itself is not modified.
+func (s Source) Overlay(central *Config) (*Config, error) {
+	if central == nil {
+		return nil, errors.New("config must not be nil")
+	}
+	data, err := json.Marshal(central)
+	if err != nil {
+		return nil, fmt.Errorf("encode central config: %w", err)
+	}
+	return s.overlay(data)
+}
+
+func (s Source) overlay(central []byte) (*Config, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("find home directory: %w", err)
+	}
+	data, applied, err := applyLocalOverlay(central, s.LocalPath)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := parseV2(data, home)
+	if err != nil && applied {
+		return nil, fmt.Errorf("with local config %q applied: %w", s.LocalPath, err)
+	}
+	return cfg, err
+}
+
+// readCentralV2 reads the central config and returns it in the current
+// format. Version 2 files are checked structurally and returned unchanged;
+// version 1 files are migrated in memory. Nothing here touches the
+// filesystem beyond reading the file, so the result is safe to edit on any
+// machine.
+func readCentralV2(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read central config %q: %w", path, err)
+	}
+	if err := ValidateJSON(data); err != nil {
+		return nil, fmt.Errorf("invalid central config: %w", err)
+	}
+	version, err := configVersion(data)
+	if err != nil {
+		return nil, fmt.Errorf("invalid central config: %w", err)
+	}
+	switch version {
+	case 1:
+		if err := validateRequiredFieldsV1(data); err != nil {
+			return nil, fmt.Errorf("invalid central config: %w", err)
+		}
+		var legacy configV1
+		if err := decodeStrict(data, &legacy); err != nil {
+			return nil, fmt.Errorf("invalid central config: %w", err)
+		}
+		cfg, err := migrateV1(legacy)
+		if err != nil {
+			return nil, err
+		}
+		cfg.normalizeCollections()
+		migrated, err := json.Marshal(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("encode migrated central config: %w", err)
+		}
+		return migrated, nil
+	case CurrentVersion:
+		if err := validateRequiredFieldsV2(data); err != nil {
+			return nil, fmt.Errorf("invalid central config: %w", err)
+		}
+		if err := decodeStrict(data, &Config{}); err != nil {
+			return nil, fmt.Errorf("invalid central config: %w", err)
+		}
+		return data, nil
+	default:
+		return nil, fmt.Errorf(
+			"unsupported config version %d (expected %d)",
+			version,
+			CurrentVersion,
+		)
+	}
+}
+
+// applyLocalOverlay merges the local config file, when it exists, into a
+// version 2 central config and reports whether anything was applied.
+func applyLocalOverlay(central []byte, localPath string) ([]byte, bool, error) {
+	patch, present, err := readLocalPatch(localPath)
+	if err != nil || !present {
+		return central, false, err
+	}
+	merged, err := applyLocalPatch(central, patch, localPath)
+	if err != nil {
+		return nil, false, err
+	}
+	return merged, true, nil
+}
+
+// readLocalPatch reads the local overlay. A missing file, or an empty path,
+// means there is no overlay.
+func readLocalPatch(localPath string) ([]byte, bool, error) {
+	if localPath == "" {
+		return nil, false, nil
+	}
+	patch, err := os.ReadFile(localPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read local config %q: %w", localPath, err)
+	}
+	return patch, true, nil
+}
+
+// applyLocalPatch merges the overlay into a version 2 central config using
+// JSON merge patch semantics (RFC 7386): objects merge key by key, any other
+// value replaces the central value, and null removes a key. Errors that the
+// overlay introduces name the local file.
+func applyLocalPatch(central, patch []byte, localPath string) ([]byte, error) {
+	invalid := func(err error) error {
+		return fmt.Errorf("invalid local config %q: %w", localPath, err)
+	}
+	if err := ValidateJSON(patch); err != nil {
+		return nil, invalid(err)
+	}
+	if firstJSONByte(patch) != '{' {
+		return nil, invalid(errors.New("top-level configuration must be an object"))
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(patch, &root); err != nil {
+		return nil, invalid(err)
+	}
+	if rawVersion, exists := root["version"]; exists {
+		var version int
+		if err := json.Unmarshal(rawVersion, &version); err != nil || version != CurrentVersion {
+			return nil, invalid(fmt.Errorf("field %q must be %d", "version", CurrentVersion))
+		}
+	}
+	merged, err := mergePatch(central, patch)
+	if err != nil {
+		return nil, invalid(err)
+	}
+	if err := validateRequiredFieldsV2(merged); err != nil {
+		return nil, invalid(err)
+	}
+	if err := decodeStrict(merged, &Config{}); err != nil {
+		return nil, invalid(err)
+	}
+	return merged, nil
+}
+
+func mergePatch(target, patch []byte) ([]byte, error) {
+	var base, overlay any
+	if err := decodeAny(target, &base); err != nil {
+		return nil, err
+	}
+	if err := decodeAny(patch, &overlay); err != nil {
+		return nil, err
+	}
+	return json.Marshal(mergeValues(base, overlay))
+}
+
+func decodeAny(data []byte, destination *any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	return decoder.Decode(destination)
+}
+
+func mergeValues(target, patch any) any {
+	patchObject, ok := patch.(map[string]any)
+	if !ok {
+		return patch
+	}
+	targetObject, ok := target.(map[string]any)
+	if !ok {
+		targetObject = map[string]any{}
+	}
+	for key, value := range patchObject {
+		if value == nil {
+			delete(targetObject, key)
+			continue
+		}
+		targetObject[key] = mergeValues(targetObject[key], value)
+	}
+	return targetObject
 }
 
 func Save(path string, cfg *Config) error {
@@ -116,9 +578,13 @@ func Save(path string, cfg *Config) error {
 	}
 	cfg.Version = CurrentVersion
 	cfg.normalizeCollections()
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	return writeJSONFile(path, cfg, "central config")
+}
+
+func writeJSONFile(path string, value any, label string) error {
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode central config: %w", err)
+		return fmt.Errorf("encode %s: %w", label, err)
 	}
 	data = append(data, '\n')
 	mode, err := fileutil.ExistingMode(path, 0o600)
@@ -126,7 +592,7 @@ func Save(path string, cfg *Config) error {
 		return err
 	}
 	if err := fileutil.WriteAtomic(path, data, mode); err != nil {
-		return fmt.Errorf("write central config %q: %w", path, err)
+		return fmt.Errorf("write %s %q: %w", label, path, err)
 	}
 	return nil
 }
@@ -283,6 +749,16 @@ func ValidateJSON(data []byte) error {
 }
 
 func (c *Config) validate(home string) error {
+	if err := c.validateStatic(home); err != nil {
+		return err
+	}
+	return c.resolveProjectPaths(home)
+}
+
+// validateStatic checks everything that does not depend on the filesystem:
+// the version, options, MCP definitions, and scope assignments. Project paths
+// must be absolute after ~ expansion but need not exist.
+func (c *Config) validateStatic(home string) error {
 	if c.Version != CurrentVersion {
 		return fmt.Errorf("unsupported config version %d (expected %d)", c.Version, CurrentVersion)
 	}
@@ -307,12 +783,34 @@ func (c *Config) validate(home string) error {
 		return err
 	}
 
-	projectIDs := sortedKeys(c.Projects)
-	canonicalRoots := make(map[string]string, len(projectIDs))
-	for _, id := range projectIDs {
+	for _, id := range sortedKeys(c.Projects) {
 		if !idPattern.MatchString(id) {
 			return fmt.Errorf("project ID %q must match %s", id, idPattern)
 		}
+		project := c.Projects[id]
+		if _, err := expandProjectPath(project.Path, home); err != nil {
+			return fmt.Errorf("project %q: %w", id, err)
+		}
+		if err := validateScope(
+			fmt.Sprintf("project %q", id),
+			project.MCPs,
+			project.DisabledAgents,
+			c.MCPs,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveProjectPaths expands, checks, and canonicalizes every project path
+// and rejects projects that resolve to the same directory. It rewrites the
+// paths in place, so callers that intend to save the config unchanged must
+// not call it.
+func (c *Config) resolveProjectPaths(home string) error {
+	projectIDs := sortedKeys(c.Projects)
+	canonicalRoots := make(map[string]string, len(projectIDs))
+	for _, id := range projectIDs {
 		project := c.Projects[id]
 		expanded, err := expandProjectPath(project.Path, home)
 		if err != nil {
@@ -340,14 +838,6 @@ func (c *Config) validate(home string) error {
 		canonicalRoots[canonical] = id
 		project.Path = canonical
 		c.Projects[id] = project
-		if err := validateScope(
-			fmt.Sprintf("project %q", id),
-			project.MCPs,
-			project.DisabledAgents,
-			c.MCPs,
-		); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -703,6 +1193,12 @@ func firstJSONByte(data []byte) byte {
 		return 0
 	}
 	return trimmed[0]
+}
+
+// ExpandProjectPath expands a leading ~ against home and requires the result
+// to be absolute. It does not consult the filesystem.
+func ExpandProjectPath(path, home string) (string, error) {
+	return expandProjectPath(path, home)
 }
 
 func expandProjectPath(path, home string) (string, error) {

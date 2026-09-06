@@ -33,34 +33,56 @@ type Launch struct {
 	Env []string
 }
 
-// Args returns the arguments that make mcp-manager launch the named MCP. When
-// configPath is empty, the wrapper uses its default central config location.
-func Args(name, configPath string) []string {
+// ConfigFlag and LocalConfigFlag are the long options the stdio subcommand
+// accepts for the central config and its local overlay.
+const (
+	ConfigFlag      = "config"
+	LocalConfigFlag = "config-local"
+)
+
+// Args returns the arguments that make mcp-manager launch the named MCP. Empty
+// configPath and localConfigPath values select the wrapper's default
+// locations at launch time.
+func Args(name, configPath, localConfigPath string) []string {
 	args := []string{Subcommand}
 	if configPath != "" {
-		args = append(args, "--config", configPath)
+		args = append(args, "--"+ConfigFlag, configPath)
+	}
+	if localConfigPath != "" {
+		args = append(args, "--"+LocalConfigFlag, localConfigPath)
 	}
 	return append(args, name)
 }
 
 // Parse recognizes a command line produced by Args and returns the wrapped MCP
 // name. It accepts the bare command name or any path whose final element is
-// mcp-manager, optionally with a Windows .exe suffix.
+// mcp-manager, optionally with a Windows .exe suffix, followed by the stdio
+// subcommand, any --config and --config-local options, and exactly one MCP
+// name.
 func Parse(command string, args []string) (string, bool) {
 	if !isWrapperCommand(command) || len(args) == 0 || args[0] != Subcommand {
 		return "", false
 	}
 	rest := args[1:]
-	switch {
-	case len(rest) == 1 && !strings.HasPrefix(rest[0], "-"):
-		return rest[0], true
-	case len(rest) == 2 && strings.HasPrefix(rest[0], "--config=") && !strings.HasPrefix(rest[1], "-"):
-		return rest[1], true
-	case len(rest) == 3 && (rest[0] == "--config" || rest[0] == "-config") && !strings.HasPrefix(rest[2], "-"):
-		return rest[2], true
-	default:
+	for len(rest) > 0 && strings.HasPrefix(rest[0], "-") {
+		option := strings.TrimPrefix(strings.TrimPrefix(rest[0], "-"), "-")
+		flagName, _, inline := strings.Cut(option, "=")
+		if flagName != ConfigFlag && flagName != LocalConfigFlag {
+			return "", false
+		}
+		if inline {
+			rest = rest[1:]
+			continue
+		}
+		if len(rest) < 2 {
+			return "", false
+		}
+		rest = rest[2:]
+	}
+	if len(rest) != 1 {
 		return "", false
 	}
+	return rest[0], true
 }
 
 func isWrapperCommand(command string) bool {

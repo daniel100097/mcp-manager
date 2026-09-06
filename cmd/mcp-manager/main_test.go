@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -15,12 +16,12 @@ import (
 
 func TestCommandHelpUsesDoubleDashLongOptions(t *testing.T) {
 	tests := map[string][]string{
-		"sync":    {"--config", "--dry-run", "--inline-secrets"},
-		"import":  {"--config", "--dry-run", "--from", "--project"},
-		"move":    {"--config", "--dry-run"},
-		"enable":  {"--config", "--dry-run"},
-		"disable": {"--config", "--dry-run"},
-		"stdio":   {"--config"},
+		"sync":    {"--config", "--config-local", "--dry-run", "--inline-secrets"},
+		"import":  {"--config", "--config-local", "--dry-run", "--from", "--project"},
+		"move":    {"--config", "--config-local", "--dry-run"},
+		"enable":  {"--config", "--config-local", "--dry-run"},
+		"disable": {"--config", "--config-local", "--dry-run"},
+		"stdio":   {"--config", "--config-local"},
 	}
 	for command, options := range tests {
 		t.Run(command, func(t *testing.T) {
@@ -963,4 +964,163 @@ func writeTestFile(t *testing.T, path string, data []byte) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestEnableCommandWritesLocalOverlayWhenPresent(t *testing.T) {
+	environment := newMoveTestEnvironment(t)
+	centralPath := filepath.Join(environment.base, "central", "config.json")
+	cfg := environment.config()
+	setToolsGlobal(cfg, false)
+	target := cfg.Projects["target"]
+	target.Path = filepath.Join(environment.base, "missing-on-this-machine")
+	cfg.Projects["target"] = target
+	writeCentralConfig(t, centralPath, cfg)
+	localPath := config.LocalPathFor(centralPath)
+	writeTextFile(t, localPath, `{"projects": {"target": {"path": `+jsonQuote(t, environment.target)+`}}}`)
+	centralBefore := readFile(t, centralPath)
+	writeNativeSentinels(t, environment)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"enable", "--config", centralPath, "tools", "target"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(enable) code = %d, want 0\nstdout: %s\nstderr: %s", code, &stdout, &stderr)
+	}
+	if !strings.Contains(stdout.String(), "local config updated: "+localPath) {
+		t.Fatalf("enable output = %q, want the overlay as the written file", stdout.String())
+	}
+	if after := readFile(t, centralPath); !bytes.Equal(after, centralBefore) {
+		t.Fatalf("enable modified the central config:\n before %s\n after  %s", centralBefore, after)
+	}
+	var overlay map[string]any
+	if err := json.Unmarshal(readFile(t, localPath), &overlay); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"projects": map[string]any{
+			"target": map[string]any{"path": environment.target, "mcps": []any{"tools"}},
+		},
+	}
+	if !reflect.DeepEqual(overlay, want) {
+		t.Fatalf("overlay = %#v, want %#v", overlay, want)
+	}
+	effective, err := config.Source{Path: centralPath, LocalPath: localPath}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMCPProjectAssignments(t, effective, "tools", "other", "target")
+	assertGeneratedTargetsInSync(t, environment, centralPath, effective)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"enable", "--config", centralPath, "tools", "target"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("second run(enable) code = %d, want 0\nstderr: %s", code, &stderr)
+	}
+	if !strings.Contains(stdout.String(), "local config unchanged") {
+		t.Fatalf("second enable output = %q, want an unchanged overlay", stdout.String())
+	}
+}
+
+func TestImportCommandWritesLocalOverlayWhenPresent(t *testing.T) {
+	environment := newMoveTestEnvironment(t)
+	centralPath := filepath.Join(environment.base, "central", "config.json")
+	writeCentralConfig(t, centralPath, environment.config())
+	localPath := config.LocalPathFor(centralPath)
+	writeTextFile(t, localPath, "{}")
+	writeTextFile(t, filepath.Join(environment.home, ".claude.json"), `{"mcpServers": {"fresh": {"type": "stdio", "command": "fresh-server"}}}`)
+	centralBefore := readFile(t, centralPath)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"import", "--config", centralPath, "--from", "claude"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(import) code = %d, want 0\nstdout: %s\nstderr: %s", code, &stdout, &stderr)
+	}
+	if !strings.Contains(stdout.String(), "local config updated: "+localPath) {
+		t.Fatalf("import output = %q, want the overlay as the written file", stdout.String())
+	}
+	if after := readFile(t, centralPath); !bytes.Equal(after, centralBefore) {
+		t.Fatalf("import modified the central config:\n before %s\n after  %s", centralBefore, after)
+	}
+	var overlay map[string]any
+	if err := json.Unmarshal(readFile(t, localPath), &overlay); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"global": map[string]any{"mcps": []any{"fresh", "other-mcp", "tools"}},
+		"mcps":   map[string]any{"fresh": map[string]any{"type": "stdio", "command": "fresh-server"}},
+	}
+	if !reflect.DeepEqual(overlay, want) {
+		t.Fatalf("overlay = %#v, want %#v", overlay, want)
+	}
+}
+
+func TestStdioCommandUsesLocalOverlay(t *testing.T) {
+	environment := newMoveTestEnvironment(t)
+	centralPath := filepath.Join(environment.base, "config.json")
+	cfg := environment.config()
+	tools := cfg.MCPs["tools"]
+	tools.Command = os.Args[0]
+	cfg.MCPs["tools"] = tools
+	writeCentralConfig(t, centralPath, cfg)
+	writeTextFile(t, config.LocalPathFor(centralPath), `{"mcps": {"tools": {"args": ["override.js"], "env": {"LOG_LEVEL": "trace"}}}}`)
+
+	var captured wrapper.Launch
+	restore := execLaunch
+	execLaunch = func(launch wrapper.Launch) (int, error) {
+		captured = launch
+		return 0, nil
+	}
+	t.Cleanup(func() { execLaunch = restore })
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"stdio", "--config", centralPath, "tools"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(stdio) code = %d, want 0\nstderr: %s", code, &stderr)
+	}
+	if want := []string{os.Args[0], "override.js"}; !reflect.DeepEqual(captured.Args, want) {
+		t.Fatalf("launch args = %#v, want %#v", captured.Args, want)
+	}
+	if stringIndex(captured.Env, "LOG_LEVEL=trace") < 0 {
+		t.Fatalf("launch env lacks the overlay value: %#v", captured.Env)
+	}
+}
+
+func TestSyncHonorsLocalConfigEnvironmentVariable(t *testing.T) {
+	environment := newMoveTestEnvironment(t)
+	centralPath := filepath.Join(environment.base, "central", "config.json")
+	writeCentralConfig(t, centralPath, environment.config())
+	overridePath := filepath.Join(environment.base, "overrides", "machine.json")
+	writeTextFile(t, overridePath, `{"global": {"mcps": ["tools"]}}`)
+	t.Setenv("MCP_MANAGER_CONFIG_LOCAL", overridePath)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"sync", "--config", centralPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(sync) code = %d, want 0\nstdout: %s\nstderr: %s", code, &stdout, &stderr)
+	}
+	claude := string(readFile(t, filepath.Join(environment.home, ".claude.json")))
+	for _, fragment := range []string{`"--config-local"`, overridePath} {
+		if !strings.Contains(claude, fragment) {
+			t.Fatalf("generated Claude config lacks %q:\n%s", fragment, claude)
+		}
+	}
+	if strings.Contains(claude, "other-mcp") {
+		t.Fatalf("generated Claude config ignores the overlay:\n%s", claude)
+	}
+}
+
+func writeTextFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func jsonQuote(t *testing.T, value string) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }

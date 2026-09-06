@@ -459,3 +459,357 @@ func mustJSON(t *testing.T, value any) []byte {
 	}
 	return data
 }
+
+func TestSourceLoadAppliesLocalOverlay(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "real")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(base, "config.json")
+	local := LocalPathFor(central)
+	writeTestFile(t, central, `{
+  "version": 2,
+  "options": {"stdioMode": "direct"},
+  "global": {"mcps": ["shared"], "disabledAgents": {"shared": ["codex"]}},
+  "projects": {"api": {"path": "/does/not/exist", "mcps": ["shared", "gone"]}},
+  "mcps": {
+    "shared": {"type": "http", "url": "https://example.com/mcp"},
+    "gone": {"type": "stdio", "command": "old"}
+  }
+}`)
+	writeTestFile(t, local, `{
+  "options": {"inlineSecrets": true},
+  "global": {"mcps": ["shared", "extra"]},
+  "projects": {"api": {"path": `+jsonString(t, root)+`, "mcps": ["shared"]}},
+  "mcps": {
+    "gone": null,
+    "extra": {"type": "stdio", "command": "extra-server", "args": ["--flag"]}
+  }
+}`)
+
+	if _, err := Load(central); err == nil || !strings.Contains(err.Error(), "/does/not/exist") {
+		t.Fatalf("Load(central only) error = %v, want missing project path", err)
+	}
+	cfg, err := Source{Path: central, LocalPath: local}.Load()
+	if err != nil {
+		t.Fatalf("Source.Load() error = %v", err)
+	}
+	if cfg.Options != (Options{InlineSecrets: true, StdioMode: StdioModeDirect}) {
+		t.Fatalf("options = %#v, want merged options", cfg.Options)
+	}
+	if !reflect.DeepEqual(cfg.Global.MCPs, []string{"shared", "extra"}) {
+		t.Fatalf("global MCPs = %#v, want overlay list", cfg.Global.MCPs)
+	}
+	if !reflect.DeepEqual(cfg.Global.DisabledAgents["shared"], []Agent{AgentCodex}) {
+		t.Fatalf("global disabledAgents = %#v, want central exclusions kept", cfg.Global.DisabledAgents)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project := cfg.Projects["api"]; project.Path != canonicalRoot || !reflect.DeepEqual(project.MCPs, []string{"shared"}) {
+		t.Fatalf("project = %#v, want overlay path and MCP list", project)
+	}
+	if _, exists := cfg.MCPs["gone"]; exists {
+		t.Fatal("null in the overlay did not remove the MCP definition")
+	}
+	if extra := cfg.MCPs["extra"]; extra.Command != "extra-server" || !reflect.DeepEqual(extra.Args, []string{"--flag"}) {
+		t.Fatalf("added MCP = %#v", extra)
+	}
+}
+
+func TestSourceLoadWithoutLocalFileMatchesLoad(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(base, "config.json")
+	writeTestFile(t, central, `{"version":2,"global":{"mcps":["tool"]},"projects":{"api":{"path":`+jsonString(t, root)+`,"mcps":[]}},"mcps":{"tool":{"type":"stdio","command":"tool"}}}`)
+
+	plain, err := Load(central)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	layered, err := Source{Path: central, LocalPath: LocalPathFor(central)}.Load()
+	if err != nil {
+		t.Fatalf("Source.Load() error = %v", err)
+	}
+	if !reflect.DeepEqual(plain, layered) {
+		t.Fatalf("missing overlay changed the result:\n plain   %#v\n layered %#v", plain, layered)
+	}
+}
+
+func TestSourceLoadRejectsInvalidLocalOverlays(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(base, "config.json")
+	writeTestFile(t, central, `{"version":2,"global":{"mcps":["tool"]},"projects":{"api":{"path":`+jsonString(t, root)+`,"mcps":[]}},"mcps":{"tool":{"type":"stdio","command":"tool"}}}`)
+	local := filepath.Join(base, "overrides.json")
+
+	tests := []struct {
+		name    string
+		local   string
+		wantErr string
+	}{
+		{name: "malformed", local: `{`, wantErr: "invalid local config"},
+		{name: "duplicate key", local: `{"mcps":{},"mcps":{}}`, wantErr: `duplicate key "mcps"`},
+		{name: "array", local: `[]`, wantErr: "must be an object"},
+		{name: "wrong version", local: `{"version":1}`, wantErr: `field "version" must be 2`},
+		{name: "null version", local: `{"version":null}`, wantErr: `field "version" must be 2`},
+		{name: "unknown field", local: `{"surprise":true}`, wantErr: "unknown field"},
+		{name: "removes required field", local: `{"mcps":null}`, wantErr: `required field "mcps" is missing`},
+		{name: "unknown reference", local: `{"global":{"mcps":["missing"]}}`, wantErr: `references unknown MCP "missing"`},
+		{name: "missing directory", local: `{"projects":{"api":{"path":"/does/not/exist"}}}`, wantErr: "/does/not/exist"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writeTestFile(t, local, test.local)
+			_, err := Source{Path: central, LocalPath: local}.Load()
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) || !strings.Contains(err.Error(), local) {
+				t.Fatalf("Source.Load() error = %v, want %q naming %s", err, test.wantErr, local)
+			}
+		})
+	}
+}
+
+func TestSourceLoadAppliesOverlayToVersion1Central(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(base, "config.json")
+	local := LocalPathFor(central)
+	writeTestFile(t, central, `{"version":1,"projects":{"api":`+jsonString(t, root)+`},"mcps":{"tool":{"type":"stdio","command":"tool","global":true,"projects":["api"]}}}`)
+	writeTestFile(t, local, `{"mcps":{"tool":{"command":"replacement"}}}`)
+
+	cfg, err := Source{Path: central, LocalPath: local}.Load()
+	if err != nil {
+		t.Fatalf("Source.Load() error = %v", err)
+	}
+	if cfg.MCPs["tool"].Command != "replacement" {
+		t.Fatalf("command = %q, want overlay value", cfg.MCPs["tool"].Command)
+	}
+	if !reflect.DeepEqual(cfg.Global.MCPs, []string{"tool"}) || !reflect.DeepEqual(cfg.Projects["api"].MCPs, []string{"tool"}) {
+		t.Fatalf("migrated activations lost: global %#v, project %#v", cfg.Global.MCPs, cfg.Projects["api"].MCPs)
+	}
+}
+
+func TestLocalPathFor(t *testing.T) {
+	tests := map[string]string{
+		"config.json":                         "config.local.json",
+		filepath.Join("dir", "central.jsonc"): filepath.Join("dir", "central.local.jsonc"),
+		"central":                             "central.local.json",
+	}
+	for input, want := range tests {
+		if got := LocalPathFor(input); got != want {
+			t.Fatalf("LocalPathFor(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestOpenEditWritesLocalOverlayWhenPresent(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(base, "config.json")
+	local := LocalPathFor(central)
+	writeTestFile(t, central, `{
+  "version": 2,
+  "global": {"mcps": ["shared"]},
+  "projects": {"api": {"path": "/missing/on/this/machine", "mcps": []}},
+  "mcps": {
+    "shared": {"type": "http", "url": "https://example.com/mcp"},
+    "tool": {"type": "stdio", "command": "tool"}
+  }
+}`)
+	writeTestFile(t, local, `{
+  "projects": {"api": {"path": `+jsonString(t, root)+`}},
+  "mcps": {"shared": {"url": "https://example.com/mcp"}}
+}`)
+	centralBefore := readTestFile(t, central)
+	source := Source{Path: central, LocalPath: local}
+
+	edit, err := source.OpenEdit()
+	if err != nil {
+		t.Fatalf("OpenEdit() error = %v", err)
+	}
+	if !edit.WritesLocal() || edit.Target() != local || edit.Label() != "local config" {
+		t.Fatalf("edit targets %q (local %v), want the overlay", edit.Target(), edit.WritesLocal())
+	}
+	if edit.Config.Projects["api"].Path != root {
+		t.Fatalf("editable path = %q, want the overlay value as written", edit.Config.Projects["api"].Path)
+	}
+
+	project := edit.Config.Projects["api"]
+	project.MCPs = append(project.MCPs, "tool")
+	edit.Config.Projects["api"] = project
+	effective, err := edit.Effective()
+	if err != nil {
+		t.Fatalf("Effective() error = %v", err)
+	}
+	if !reflect.DeepEqual(effective.Projects["api"].MCPs, []string{"tool"}) {
+		t.Fatalf("effective project MCPs = %#v", effective.Projects["api"].MCPs)
+	}
+	if err := edit.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	if after := readTestFile(t, central); after != centralBefore {
+		t.Fatalf("Save() modified the central config:\n before %s\n after  %s", centralBefore, after)
+	}
+	want := map[string]any{
+		"projects": map[string]any{"api": map[string]any{"path": root, "mcps": []any{"tool"}}},
+		"mcps":     map[string]any{"shared": map[string]any{"url": "https://example.com/mcp"}},
+	}
+	if got := decodeTestJSON(t, local); !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay after Save() = %#v, want %#v", got, want)
+	}
+	reloaded, err := source.Load()
+	if err != nil {
+		t.Fatalf("Load() after Save() error = %v", err)
+	}
+	if !reflect.DeepEqual(reloaded.Projects["api"].MCPs, []string{"tool"}) {
+		t.Fatalf("reloaded project MCPs = %#v", reloaded.Projects["api"].MCPs)
+	}
+}
+
+func TestOpenEditDropsOverridesThatReturnToCentralValues(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(base, "config.json")
+	local := LocalPathFor(central)
+	writeTestFile(t, central, `{"version":2,"global":{"mcps":["shared"]},"projects":{"api":{"path":`+jsonString(t, root)+`,"mcps":[]}},"mcps":{"shared":{"type":"http","url":"https://example.com/mcp"},"tool":{"type":"stdio","command":"tool"}}}`)
+	writeTestFile(t, local, `{"global":{"mcps":["shared","tool"]}}`)
+
+	edit, err := Source{Path: central, LocalPath: local}.OpenEdit()
+	if err != nil {
+		t.Fatalf("OpenEdit() error = %v", err)
+	}
+	edit.Config.Global.MCPs = []string{"shared"}
+	delete(edit.Config.MCPs, "tool")
+	if _, err := edit.Effective(); err != nil {
+		t.Fatalf("Effective() error = %v", err)
+	}
+	if err := edit.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	want := map[string]any{"mcps": map[string]any{"tool": nil}}
+	if got := decodeTestJSON(t, local); !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay after Save() = %#v, want %#v", got, want)
+	}
+}
+
+func TestOpenEditWritesCentralWithoutLocalOverlay(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	central := filepath.Join(home, "config.json")
+	writeTestFile(t, central, `{"version":2,"global":{"mcps":[]},"projects":{"api":{"path":"~/project","mcps":[]}},"mcps":{"tool":{"type":"stdio","command":"tool"}}}`)
+	source := Source{Path: central, LocalPath: LocalPathFor(central)}
+
+	edit, err := source.OpenEdit()
+	if err != nil {
+		t.Fatalf("OpenEdit() error = %v", err)
+	}
+	if edit.WritesLocal() || edit.Target() != central || edit.Label() != "central config" {
+		t.Fatalf("edit targets %q (local %v), want the central config", edit.Target(), edit.WritesLocal())
+	}
+	if edit.Config.Projects["api"].Path != "~/project" {
+		t.Fatalf("editable path = %q, want the value as written", edit.Config.Projects["api"].Path)
+	}
+	edit.Config.Global.MCPs = []string{"tool"}
+	effective, err := edit.Effective()
+	if err != nil {
+		t.Fatalf("Effective() error = %v", err)
+	}
+	if !filepath.IsAbs(effective.Projects["api"].Path) || !reflect.DeepEqual(effective.Global.MCPs, []string{"tool"}) {
+		t.Fatalf("effective config = %#v", effective)
+	}
+	if err := edit.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	saved := readTestFile(t, central)
+	if !strings.Contains(saved, `"~/project"`) || !strings.Contains(saved, `"tool"`) {
+		t.Fatalf("saved central config = %s", saved)
+	}
+	if _, err := os.Stat(source.LocalPath); !os.IsNotExist(err) {
+		t.Fatalf("Save() created the overlay %s: %v", source.LocalPath, err)
+	}
+}
+
+func TestDiffValuesProducesMergePatch(t *testing.T) {
+	var source, target any
+	if err := decodeAny([]byte(`{"a":1,"b":{"c":[1,2],"d":"x"},"e":"gone","f":{"g":true}}`), &source); err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeAny([]byte(`{"a":1,"b":{"c":[1,3],"d":"x"},"f":{"g":true,"h":{}}}`), &target); err != nil {
+		t.Fatal(err)
+	}
+	patch, changed := diffValues(source, target)
+	if !changed {
+		t.Fatal("diffValues() reported no change")
+	}
+	var want any
+	if err := decodeAny([]byte(`{"b":{"c":[1,3]},"e":null,"f":{"h":{}}}`), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(patch, want) {
+		t.Fatalf("patch = %#v, want %#v", patch, want)
+	}
+	if got := mergeValues(deepCopy(source), patch); !reflect.DeepEqual(got, target) {
+		t.Fatalf("applying the patch = %#v, want %#v", got, target)
+	}
+	if _, changed := diffValues(target, deepCopy(target)); changed {
+		t.Fatal("diffValues() reported a change for equal values")
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readTestFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func decodeTestJSON(t *testing.T, path string) any {
+	t.Helper()
+	var value any
+	if err := json.Unmarshal([]byte(readTestFile(t, path)), &value); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+	return value
+}
+
+func jsonString(t *testing.T, value string) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}

@@ -572,3 +572,57 @@ func mapKeyForPath(path string) string {
 	}
 	return "mcp"
 }
+
+func TestSyncEmbedsNonDefaultLocalConfigPathInWrapperArgs(t *testing.T) {
+	base := t.TempDir()
+	options := testOptions(t, base)
+	options.ConfigPath = StandardConfigPath(options.UserConfigDir)
+	options.LocalConfigPath = filepath.Join(base, "elsewhere", "overrides.json")
+
+	if _, err := Sync(wrapperTestConfig(), options); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	wantArgs := []any{"stdio", "--config-local", options.LocalConfigPath, "local"}
+	claudeLocal := nestedMap(t, readJSON(t, filepath.Join(options.HomeDir, ".claude.json")), "mcpServers", "local")
+	if !reflect.DeepEqual(claudeLocal["args"], wantArgs) {
+		t.Fatalf("Claude wrapper args = %#v, want %#v", claudeLocal["args"], wantArgs)
+	}
+}
+
+func TestSyncOmitsDefaultLocalConfigPathFromWrapperArgs(t *testing.T) {
+	base := t.TempDir()
+	options := testOptions(t, base)
+	options.ConfigPath = filepath.Join(base, "elsewhere", "central.json")
+	options.LocalConfigPath = filepath.Join(base, "elsewhere", "central.local.json")
+
+	if _, err := Sync(wrapperTestConfig(), options); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	wantArgs := []any{"stdio", "--config", options.ConfigPath, "local"}
+	claudeLocal := nestedMap(t, readJSON(t, filepath.Join(options.HomeDir, ".claude.json")), "mcpServers", "local")
+	if !reflect.DeepEqual(claudeLocal["args"], wantArgs) {
+		t.Fatalf("Claude wrapper args = %#v, want %#v", claudeLocal["args"], wantArgs)
+	}
+}
+
+func TestDefaultLocalConfigPath(t *testing.T) {
+	t.Setenv("MCP_MANAGER_CONFIG_LOCAL", "")
+	central := filepath.Join("central", "config.json")
+	got, err := DefaultLocalConfigPath(central)
+	if err != nil {
+		t.Fatalf("DefaultLocalConfigPath() error = %v", err)
+	}
+	if want := filepath.Join("central", "config.local.json"); got != want {
+		t.Fatalf("DefaultLocalConfigPath() = %q, want %q", got, want)
+	}
+
+	override := filepath.Join(t.TempDir(), "overrides.json")
+	t.Setenv("MCP_MANAGER_CONFIG_LOCAL", override)
+	got, err = DefaultLocalConfigPath(central)
+	if err != nil {
+		t.Fatalf("DefaultLocalConfigPath() with override error = %v", err)
+	}
+	if got != override {
+		t.Fatalf("DefaultLocalConfigPath() with override = %q, want %q", got, override)
+	}
+}

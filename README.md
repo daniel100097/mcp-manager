@@ -1,9 +1,10 @@
 # mcp-manager
 
 `mcp-manager` keeps one central JSON configuration of MCP servers and generates
-the MCP sections used by Codex, Claude Code, and OpenCode. The central file is
-the sole source of truth; agent configs are generated outputs. It supports
-local `stdio` servers, remote streamable HTTP servers, global activation,
+the MCP sections used by Codex, Claude Code, and OpenCode. The central file,
+optionally combined with a machine-specific local override file, is the sole
+source of truth; agent configs are generated outputs. It supports local
+`stdio` servers, remote streamable HTTP servers, global activation,
 per-project activation, per-scope agent exclusions, and optional secret
 materialization. Generated `stdio` entries launch `mcp-manager stdio NAME`,
 so agents always start local servers through `mcp-manager` and pick up the
@@ -27,7 +28,8 @@ release workflow.
 
 The default central config is `<user-config-dir>/mcp-manager/config.json`
 (`~/.config/mcp-manager/config.json` on Linux). Set `MCP_MANAGER_CONFIG` or use
-`--config` to choose another file.
+`--config` to choose another file. Machine-specific settings go into
+`config.local.json` next to it; see [Local overrides](#local-overrides).
 
 ```bash
 mkdir -p ~/.config/mcp-manager
@@ -101,6 +103,56 @@ The complete machine-readable definition is in
 [`mcp-manager.schema.json`](./mcp-manager.schema.json), with a ready-to-edit
 configuration in [`mcp-manager.example.json`](./mcp-manager.example.json).
 
+## Local overrides
+
+A second file next to the central config, `config.local.json` for
+`config.json`, holds settings that belong to one machine. Set
+`MCP_MANAGER_CONFIG_LOCAL` or pass `--config-local PATH` to any command to
+choose another file. The local file is optional; when it does not exist,
+nothing changes.
+
+The local file is a JSON merge patch ([RFC 7386](https://www.rfc-editor.org/rfc/rfc7386))
+applied to the central config: objects merge key by key, any other value
+replaces the central value, and `null` removes a key. It uses the same layout
+as the central config, but every field is optional and `version`, if present,
+must be `2`. Arrays such as `global.mcps` and a project's `mcps` list are
+replaced as a whole, so a local file that changes one of them must list every
+name it wants active.
+
+```json
+{
+  "projects": {
+    "api": {"path": "/mnt/work/api"},
+    "scratch": {"path": "~/scratch", "mcps": ["filesystem"]}
+  },
+  "mcps": {
+    "docs": null,
+    "filesystem": {"args": ["-y", "@modelcontextprotocol/server-filesystem", "/mnt/work"]}
+  }
+}
+```
+
+This overrides one project's path, registers a project that exists only on
+this machine, removes the `docs` MCP, and changes the arguments of
+`filesystem` while keeping its other fields. Only the combined result is
+validated, so the central config may list projects whose directories exist on
+another machine as long as the local file corrects or removes them here. That
+keeps the central file shareable, for example in a dotfiles repository.
+
+When the local file exists, it also receives every change made by `import`,
+`enable`, `disable`, and `move`, and the central config is left untouched as
+the shared defaults. `mcp-manager` rewrites the local file as the patch that
+turns the central config into the edited result, keeping entries that still
+match the central values so that a deliberate pin survives. Create a local
+file containing `{}` to start recording changes locally. Without a local
+file, those commands write to the central config.
+
+Generated wrapper entries include `--config-local PATH` when the local file is
+not the default sibling of the central config, so `mcp-manager stdio` applies
+the same overrides at launch. The local file has no JSON Schema because it
+describes a partial document; do not point its `$schema` at
+`mcp-manager.schema.json`.
+
 ## Launching stdio servers through mcp-manager
 
 By default, every generated `stdio` entry runs the `mcp-manager` binary
@@ -140,7 +192,9 @@ Requirements and details:
   and OpenCode. The build instructions above install it to `~/.local/bin`.
 - When `sync` runs with a config outside the default location, whether through
   `--config` or `MCP_MANAGER_CONFIG`, the generated entries include
-  `--config /absolute/path` so the wrapper reads the same file.
+  `--config /absolute/path` so the wrapper reads the same file. A local
+  override file outside its default location is embedded as `--config-local`
+  in the same way.
 - `envFrom` references are still generated in each agent's native form so the
   agent forwards those variables to the wrapper. Codex in particular starts
   MCP servers with a minimal environment and only passes the variables listed

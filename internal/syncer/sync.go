@@ -23,6 +23,10 @@ type Options struct {
 	// entries embed it as --config when it is not the default location, so
 	// that "mcp-manager stdio NAME" finds the same file at launch time.
 	ConfigPath string
+	// LocalConfigPath is the local overlay the caller applied. Generated
+	// wrapper entries embed it as --config-local when it is not the default
+	// sibling of the central config.
+	LocalConfigPath string
 }
 
 // renderSettings holds the per-sync inputs that shape every generated server
@@ -34,6 +38,9 @@ type renderSettings struct {
 	// wrapperConfig is the --config value for generated wrapper entries, or
 	// empty when the default central config location is in use.
 	wrapperConfig string
+	// wrapperLocalConfig is the --config-local value for generated wrapper
+	// entries, or empty when the overlay sits next to the central config.
+	wrapperLocalConfig string
 }
 
 type Change struct {
@@ -109,6 +116,20 @@ func StandardConfigPath(userConfigDir string) string {
 	return filepath.Join(userConfigDir, "mcp-manager", "config.json")
 }
 
+// DefaultLocalConfigPath returns the local overlay for the given central
+// config: MCP_MANAGER_CONFIG_LOCAL when set, otherwise the central path with
+// a .local.json suffix.
+func DefaultLocalConfigPath(configPath string) (string, error) {
+	if override := os.Getenv("MCP_MANAGER_CONFIG_LOCAL"); override != "" {
+		absolute, err := filepath.Abs(override)
+		if err != nil {
+			return "", fmt.Errorf("resolve MCP_MANAGER_CONFIG_LOCAL: %w", err)
+		}
+		return filepath.Clean(absolute), nil
+	}
+	return config.LocalPathFor(configPath), nil
+}
+
 func Sync(cfg *config.Config, options Options) (Result, error) {
 	if cfg == nil {
 		return Result{}, errors.New("config must not be nil")
@@ -173,16 +194,28 @@ func newRenderSettings(cfg *config.Config, options Options) (renderSettings, err
 		lookupEnv:     options.LookupEnv,
 		wrapStdio:     cfg.Options.WrapStdio(),
 	}
-	if !settings.wrapStdio || options.ConfigPath == "" {
+	if !settings.wrapStdio {
 		return settings, nil
 	}
-	absolute, err := filepath.Abs(options.ConfigPath)
-	if err != nil {
-		return renderSettings{}, fmt.Errorf("resolve central config path %q: %w", options.ConfigPath, err)
+	configPath := filepath.Clean(StandardConfigPath(options.UserConfigDir))
+	if options.ConfigPath != "" {
+		absolute, err := filepath.Abs(options.ConfigPath)
+		if err != nil {
+			return renderSettings{}, fmt.Errorf("resolve central config path %q: %w", options.ConfigPath, err)
+		}
+		if absolute = filepath.Clean(absolute); absolute != configPath {
+			configPath = absolute
+			settings.wrapperConfig = absolute
+		}
 	}
-	absolute = filepath.Clean(absolute)
-	if absolute != filepath.Clean(StandardConfigPath(options.UserConfigDir)) {
-		settings.wrapperConfig = absolute
+	if options.LocalConfigPath != "" {
+		absolute, err := filepath.Abs(options.LocalConfigPath)
+		if err != nil {
+			return renderSettings{}, fmt.Errorf("resolve local config path %q: %w", options.LocalConfigPath, err)
+		}
+		if absolute = filepath.Clean(absolute); absolute != filepath.Clean(config.LocalPathFor(configPath)) {
+			settings.wrapperLocalConfig = absolute
+		}
 	}
 	return settings, nil
 }
@@ -291,7 +324,7 @@ func wrapStdio(name string, mcp config.MCP, settings renderSettings) config.MCP 
 	}
 	wrapped := mcp
 	wrapped.Command = wrapper.Command
-	wrapped.Args = wrapper.Args(name, settings.wrapperConfig)
+	wrapped.Args = wrapper.Args(name, settings.wrapperConfig, settings.wrapperLocalConfig)
 	wrapped.Env = nil
 	return wrapped
 }

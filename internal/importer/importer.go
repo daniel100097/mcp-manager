@@ -230,7 +230,7 @@ func selectSource(existing *config.Config, options Options) (sourceSelection, er
 		if err != nil {
 			return sourceSelection{}, fmt.Errorf("project %q: %w", options.ProjectID, err)
 		}
-		if err := ensureProjectRegistration(existing, options.ProjectID, projectPath); err != nil {
+		if err := ensureProjectRegistration(existing, options.ProjectID, projectPath, options.HomeDir); err != nil {
 			return sourceSelection{}, err
 		}
 		selection.scope = options.ProjectID
@@ -291,18 +291,15 @@ func canonicalProjectPath(path string) (string, error) {
 	return filepath.Clean(absolute), nil
 }
 
-func ensureProjectRegistration(existing *config.Config, id, path string) error {
+func ensureProjectRegistration(existing *config.Config, id, path, home string) error {
 	if existing == nil {
 		return nil
 	}
 	if registered, exists := existing.Projects[id]; exists {
-		canonical, err := canonicalProjectPath(registered.Path)
-		if err != nil {
-			return fmt.Errorf("registered project %q: %w", id, err)
-		}
-		if canonical != path {
+		canonical, err := registeredProjectPath(registered.Path, home)
+		if err != nil || canonical != path {
 			return fmt.Errorf(
-				"project %q is already registered at %q, not %q", id, canonical, path,
+				"project %q is already registered at %q, not %q", id, registered.Path, path,
 			)
 		}
 	}
@@ -310,15 +307,28 @@ func ensureProjectRegistration(existing *config.Config, id, path string) error {
 		if otherID == id {
 			continue
 		}
-		canonical, err := canonicalProjectPath(registered.Path)
+		canonical, err := registeredProjectPath(registered.Path, home)
 		if err != nil {
-			return fmt.Errorf("registered project %q: %w", otherID, err)
+			// A registered directory that does not exist on this machine
+			// cannot be the directory being imported.
+			continue
 		}
 		if canonical == path {
 			return fmt.Errorf("project path %q is already registered as %q", path, otherID)
 		}
 	}
 	return nil
+}
+
+// registeredProjectPath resolves a project path as written in the central
+// config: a leading ~ is expanded and, when the directory exists, symlinks
+// are resolved so that it compares equal to canonicalProjectPath output.
+func registeredProjectPath(path, home string) (string, error) {
+	expanded, err := config.ExpandProjectPath(path, home)
+	if err != nil {
+		return "", err
+	}
+	return canonicalProjectPath(expanded)
 }
 
 func parse(agent config.Agent, data []byte) (map[string]config.MCP, int, error) {

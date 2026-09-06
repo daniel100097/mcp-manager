@@ -356,7 +356,7 @@ func TestImportUnwrapsManagedWrapperEntries(t *testing.T) {
     "tools": {
       "type": "stdio",
       "command": "/usr/local/bin/mcp-manager",
-      "args": ["stdio", "--config", "/central/config.json", "tools"],
+      "args": ["stdio", "--config", "/central/config.json", "--config-local", "/central/config.local.json", "tools"],
       "env": {"TOKEN": "${TOKEN}"}
     }
   }
