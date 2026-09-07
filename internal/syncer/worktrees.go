@@ -19,6 +19,12 @@ type gitWorktree struct {
 	prunable bool
 }
 
+// DiscoverWorktrees returns the existing checkout roots for an opted-in
+// project, using the same rules as sync. Callers must check IncludeWorktrees.
+func DiscoverWorktrees(root string) ([]string, error) {
+	return discoverWorktrees(root)
+}
+
 // discoverWorktrees returns existing checkout roots, including the main
 // checkout. NUL-delimited porcelain preserves spaces, newlines and quotes in
 // paths. A registered subdirectory is deliberately not expanded to its repo.

@@ -144,9 +144,13 @@ func (s Source) Load() (*Config, error) {
 // writes it. In both cases project paths stay exactly as written.
 type Edit struct {
 	source Source
-	// central is the canonical version 2 form of the central file, or nil
-	// when the central file does not exist yet.
+	// central is the canonical version 2 form of the central file. When
+	// OpenOrCreateEdit opens a missing file, this is its empty initial base.
+	// NewEdit leaves it nil.
 	central []byte
+	// createCentral records that the initial central base must be saved before
+	// an existing local overlay can be used by ordinary config readers.
+	createCentral bool
 	// local is the decoded overlay when Save writes to it.
 	local      any
 	writeLocal bool
@@ -159,7 +163,25 @@ type Edit struct {
 // neither resolved nor required to exist, so a shared central config stays
 // editable on machines where the overlay supplies the real paths.
 func (s Source) OpenEdit() (*Edit, error) {
+	return s.openEdit(false)
+}
+
+// OpenOrCreateEdit opens a config for modification, starting with empty
+// defaults when the central file is missing. An existing local overlay is
+// applied and remains the destination for edits. Nothing is written until
+// Save, which creates the empty central base before saving the edited overlay.
+func (s Source) OpenOrCreateEdit() (*Edit, error) {
+	return s.openEdit(true)
+}
+
+func (s Source) openEdit(create bool) (*Edit, error) {
 	central, err := readCentralV2(s.Path)
+	createCentral := create && errors.Is(err, os.ErrNotExist)
+	if createCentral {
+		empty := &Config{Version: CurrentVersion}
+		empty.normalizeCollections()
+		central, err = json.Marshal(empty)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +210,7 @@ func (s Source) OpenEdit() (*Edit, error) {
 		}
 		return nil, err
 	}
-	edit := &Edit{source: s, central: central, writeLocal: present, Config: &cfg}
+	edit := &Edit{source: s, central: central, createCentral: createCentral, writeLocal: present, Config: &cfg}
 	if present {
 		if err := decodeAny(patch, &edit.local); err != nil {
 			return nil, fmt.Errorf("invalid local config %q: %w", s.LocalPath, err)
@@ -208,6 +230,12 @@ func (s Source) NewEdit(cfg *Config) *Edit {
 // central config.
 func (e *Edit) WritesLocal() bool {
 	return e.writeLocal
+}
+
+// NeedsInitialization reports whether Save must create the central base even
+// if the requested settings already exist in a local overlay.
+func (e *Edit) NeedsInitialization() bool {
+	return e.createCentral
 }
 
 // Target returns the file that Save writes.
@@ -252,13 +280,18 @@ func (e *Edit) Effective() (*Config, error) {
 // rewrites the overlay as the merge patch that turns the central config into
 // Config, preserving overlay entries that still have no effect (such as a
 // value pinned to its central default). Without an overlay it writes the
-// central file.
+// central file. When OpenOrCreateEdit opened an existing overlay without a
+// central file, Save first creates an empty central base for that overlay.
 func (e *Edit) Save() error {
 	if e.Config == nil {
 		return errors.New("config must not be nil")
 	}
 	if !e.writeLocal {
-		return Save(e.source.Path, e.Config)
+		if err := Save(e.source.Path, e.Config); err != nil {
+			return err
+		}
+		e.createCentral = false
+		return nil
 	}
 	e.Config.Version = CurrentVersion
 	e.Config.normalizeCollections()
@@ -269,6 +302,17 @@ func (e *Edit) Save() error {
 	patch, err := localPatchFor(e.central, e.local, edited)
 	if err != nil {
 		return err
+	}
+	if e.createCentral {
+		// Validate the overlay destination before creating the base. An invalid
+		// destination must not leave a newly created central file behind.
+		if _, err := fileutil.ExistingMode(e.source.LocalPath, 0o600); err != nil {
+			return err
+		}
+		if err := writeJSONFile(e.source.Path, json.RawMessage(e.central), "central config"); err != nil {
+			return err
+		}
+		e.createCentral = false
 	}
 	return writeJSONFile(e.source.LocalPath, patch, "local config")
 }

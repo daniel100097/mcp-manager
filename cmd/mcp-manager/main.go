@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,12 +25,51 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	// Common options may precede the command as well as follow it.
+	var common []string
+	for len(args) > 0 {
+		name, _, inline := strings.Cut(args[0], "=")
+		if name != "--config" && name != "--config-local" && name != "--dry-run" {
+			break
+		}
+		common = append(common, args[0])
+		args = args[1:]
+		if !inline && name != "--dry-run" {
+			if len(args) == 0 {
+				fmt.Fprintf(stderr, "error: %s requires a path\n", name)
+				return 2
+			}
+			common = append(common, args[0])
+			args = args[1:]
+		}
+	}
 	if len(args) == 0 {
 		printRootUsage(stderr)
 		return 2
 	}
+	if len(common) > 0 {
+		at := 1
+		if (args[0] == "project" || args[0] == "projects" || args[0] == "worktrees" || args[0] == "mcp") && len(args) > 1 {
+			at = 2
+		}
+		forwarded := append([]string{}, args[:at]...)
+		forwarded = append(forwarded, common...)
+		args = append(forwarded, args[at:]...)
+	}
 
 	switch args[0] {
+	case "project", "projects":
+		return runProject(args[1:], stdout, stderr)
+	case "add":
+		return runMCPAdd(args[1:], stdout, stderr)
+	case "remove", "rm":
+		return runMCPRemove(args[1:], stdout, stderr)
+	case "list", "ls":
+		return runMCPList(args[1:], stdout, stderr)
+	case "show":
+		return runMCPShow(args[1:], stdout, stderr)
+	case "mcp":
+		return run(args[1:], stdout, stderr)
 	case "sync":
 		return runSync(args[1:], stdout, stderr)
 	case "import":
@@ -103,7 +143,7 @@ func runStdio(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Usage: mcp-manager stdio [options] MCP\n\nOptions:\n")
 		printLongFlagDefaults(stderr, flags)
 	}
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
@@ -184,66 +224,99 @@ func runScopeCommand(args []string, stdout, stderr io.Writer, command scopeComma
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-
 	flags := flag.NewFlagSet(command.name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configFlags := addConfigFlags(flags, defaultConfig)
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
+	projectOption := flags.String("project", "", "project ID or path; defaults to the current directory")
+	global := flags.Bool("global", false, "use global scope; move transfers the selected project's assignment")
+	local := flags.Bool("local", false, "use project scope (default)")
+	agent := flags.String("agent", "", "enable or disable only this agent: codex, claude, or opencode")
 	flags.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: mcp-manager %s [options] MCP PROJECT\n\nOptions:\n", command.name)
+		fmt.Fprintf(stderr, "Usage: mcp-manager %s MCP [--project ID|PATH] [--global|--local] [options]\n\nThe current directory selects the project. Legacy MCP PROJECT is also accepted.\n\nOptions:\n", command.name)
 		printLongFlagDefaults(stderr, flags)
 	}
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
-	if flags.NArg() != 2 {
-		fmt.Fprintf(stderr, "error: %s requires an MCP name and a project ID\n\n", command.name)
+	if flags.NArg() < 1 || flags.NArg() > 2 {
+		fmt.Fprintf(stderr, "error: %s requires an MCP name and at most one project\n\n", command.name)
 		flags.Usage()
 		return 2
 	}
-
-	mcpName := flags.Arg(0)
-	projectID := flags.Arg(1)
+	if *global && *local {
+		fmt.Fprintln(stderr, "error: --global and --local cannot be combined")
+		return 2
+	}
+	selector, err := selectedProject(flags.Arg(1), *projectOption)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	if *global && command.name != "move" && selector != "" {
+		fmt.Fprintln(stderr, "error: --global cannot be combined with a project selector")
+		return 2
+	}
+	if *agent != "" && command.name == "move" {
+		fmt.Fprintln(stderr, "error: --agent is only supported by enable and disable")
+		return 2
+	}
+	if *agent != "" && *agent != "codex" && *agent != "claude" && *agent != "opencode" {
+		fmt.Fprintln(stderr, "error: --agent must be codex, claude, or opencode")
+		return 2
+	}
 	source, err := configFlags.source()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	edit, err := source.OpenEdit()
+	edit, err := openConfigEdit(source, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	changed, err := command.apply(edit.Config, mcpName, projectID)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
+	mcpName := flags.Arg(0)
+	if _, exists := edit.Config.MCPs[mcpName]; !exists {
+		fmt.Fprintf(stderr, "error: MCP %q does not exist; use 'mcp-manager list --all' to list definitions\n", mcpName)
 		return 1
 	}
-	// Validate the complete result before anything is written.
-	effective, err := edit.Effective()
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-
-	switch {
-	case !changed:
-		fmt.Fprintf(stdout, command.unchanged+"; %s unchanged\n", mcpName, projectID, edit.Label())
-	case *dryRun:
-		fmt.Fprintf(stdout, command.preview+"\n", mcpName, projectID)
-		fmt.Fprintf(stdout, "dry run complete: %s would change: %s\n", edit.Label(), edit.Target())
-	default:
-		if err := edit.Save(); err != nil {
+	projectID := ""
+	if !*global || command.name == "move" {
+		projectID, err = resolveProject(edit.Config, selector)
+		if err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, command.done+"\n", mcpName, projectID)
-		fmt.Fprintf(stdout, "%s updated: %s\n", edit.Label(), edit.Target())
 	}
-	return syncConfig(effective, source, false, *dryRun, stdout, stderr)
+	var changed bool
+	description := fmt.Sprintf("%s MCP %q for project %q", command.name, mcpName, projectID)
+	switch {
+	case command.name == "move" && *global:
+		changed, err = moveMCPGlobal(edit.Config, mcpName, projectID)
+		description = fmt.Sprintf("move MCP %q from project %q to global scope", mcpName, projectID)
+	case *global || *agent != "":
+		changed, err = toggleMCPScope(edit.Config, mcpName, projectID, *global, command.name == "enable", config.Agent(*agent))
+		if *global {
+			description = fmt.Sprintf("%s MCP %q in global scope", command.name, mcpName)
+		}
+		if *agent != "" {
+			description += fmt.Sprintf(" for %s", *agent)
+		}
+	default:
+		changed, err = command.apply(edit.Config, mcpName, projectID)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	code := saveAndSync(edit, source, changed, *dryRun, description, stdout, stderr)
+	if code == 0 && !*global && command.name != "move" && stringIndex(edit.Config.Global.MCPs, mcpName) >= 0 {
+		fmt.Fprintf(stdout, "Global assignment remains active. To restrict MCP %q to this project, use 'mcp-manager move %s --local'.\n", mcpName, mcpName)
+	}
+	return code
 }
 
 func disableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
@@ -257,10 +330,6 @@ func disableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	if !exists {
 		return false, fmt.Errorf("project %q is not registered", projectID)
 	}
-	if stringIndex(cfg.Global.MCPs, mcpName) >= 0 {
-		return false, fmt.Errorf("MCP %q is globally active and cannot be disabled for only one project", mcpName)
-	}
-
 	mcpIndex := stringIndex(project.MCPs, mcpName)
 	if mcpIndex == -1 {
 		return false, nil
@@ -282,9 +351,6 @@ func enableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	project, exists := cfg.Projects[projectID]
 	if !exists {
 		return false, fmt.Errorf("project %q is not registered", projectID)
-	}
-	if stringIndex(cfg.Global.MCPs, mcpName) >= 0 {
-		return false, fmt.Errorf("MCP %q is globally active; use move to make it project-only", mcpName)
 	}
 	if stringIndex(project.MCPs, mcpName) >= 0 {
 		return false, nil
@@ -322,7 +388,7 @@ func moveMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	if !alreadyAssigned {
 		project.MCPs = append(project.MCPs, mcpName)
 	}
-	if len(globalDisabledAgents) > 0 {
+	if !alreadyAssigned && len(globalDisabledAgents) > 0 {
 		if project.DisabledAgents == nil {
 			project.DisabledAgents = map[string][]config.Agent{}
 		}
@@ -354,13 +420,15 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	configFlags := addConfigFlags(flags, defaultConfig)
 	from := flags.String("from", "", "source agent: codex, claude, or opencode (required)")
-	project := flags.String("project", "", "project scope as ID=/absolute/path")
+	project := flags.String("project", "", "project ID or path, or ID=PATH to register and import")
+	local := flags.Bool("local", false, "import the current project's configuration")
+	global := flags.Bool("global", false, "import the global configuration (default)")
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: mcp-manager import --from AGENT [options]\n\nOptions:\n")
 		printLongFlagDefaults(stderr, flags)
 	}
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
@@ -369,6 +437,10 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() != 0 {
 		fmt.Fprintf(stderr, "error: unexpected argument %q\n\n", flags.Arg(0))
 		flags.Usage()
+		return 2
+	}
+	if *global && (*local || *project != "") {
+		fmt.Fprintln(stderr, "error: --global cannot be combined with --local or --project")
 		return 2
 	}
 	agent, err := parseAgent(*from)
@@ -383,23 +455,12 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	edit, err := source.OpenEdit()
-	centralExists := true
-	if errors.Is(err, os.ErrNotExist) {
-		centralExists = false
-		edit = source.NewEdit(&config.Config{
-			Version: config.CurrentVersion,
-			Global: config.Scope{
-				MCPs:           []string{},
-				DisabledAgents: map[string][]config.Agent{},
-			},
-			Projects: map[string]config.Project{},
-			MCPs:     map[string]config.MCP{},
-		})
-	} else if err != nil {
+	edit, err := openConfigEdit(source, true)
+	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	centralExists := !edit.NeedsInitialization()
 
 	options, err := importer.DefaultOptions()
 	if err != nil {
@@ -407,7 +468,7 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	options.Agent = agent
-	if *project != "" {
+	if strings.Contains(*project, "=") {
 		id, path, found := strings.Cut(*project, "=")
 		if !found || id == "" || path == "" {
 			fmt.Fprintln(stderr, "error: --project must use ID=/absolute/path")
@@ -415,6 +476,14 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 		}
 		options.ProjectID = id
 		options.ProjectPath = path
+	} else if *local || *project != "" {
+		id, err := resolveProject(edit.Config, *project)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		options.ProjectID = id
+		options.ProjectPath = edit.Config.Projects[id].Path
 	}
 
 	merged, result, err := importer.Import(edit.Config, options)
@@ -429,6 +498,11 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+	var diagnostics bytes.Buffer
+	if code := syncConfig(effective, source, false, true, io.Discard, &diagnostics); code != 0 {
+		fmt.Fprint(stderr, diagnostics.String())
+		return code
 	}
 	if changed && !*dryRun {
 		if err := edit.Save(); err != nil {
@@ -483,7 +557,7 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Usage: mcp-manager sync [options]\n\nOptions:\n")
 		printLongFlagDefaults(stderr, flags)
 	}
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
@@ -548,10 +622,18 @@ func syncConfig(cfg *config.Config, source config.Source, inlineSecrets, dryRun 
 
 func printLongFlagDefaults(output io.Writer, flags *flag.FlagSet) {
 	placeholders := map[string]string{
-		"config":       "PATH",
-		"config-local": "PATH",
-		"from":         "AGENT",
-		"project":      "ID=PATH",
+		"config":         "PATH",
+		"config-local":   "PATH",
+		"from":           "AGENT",
+		"project":        "ID|PATH",
+		"name":           "ID",
+		"url":            "URL",
+		"agent":          "AGENT",
+		"env":            "KEY=VALUE",
+		"env-from":       "VARIABLE",
+		"header":         "KEY=VALUE",
+		"header-from":    "KEY=VARIABLE",
+		"disabled-agent": "AGENT",
 	}
 	flags.VisitAll(func(option *flag.Flag) {
 		argument := ""
@@ -567,26 +649,47 @@ func printLongFlagDefaults(output io.Writer, flags *flag.FlagSet) {
 }
 
 func printRootUsage(output io.Writer) {
-	fmt.Fprintln(output, `mcp-manager keeps Codex, Claude Code, and OpenCode MCP configs in sync.
+	fmt.Fprintln(output, `Manage MCPs for Codex, Claude Code, and OpenCode.
 
-Usage:
-  mcp-manager sync [--config PATH] [--inline-secrets] [--dry-run]
-  mcp-manager import --from AGENT [--project ID=PATH] [--config PATH] [--dry-run]
-  mcp-manager enable [--config PATH] [--dry-run] MCP PROJECT
-  mcp-manager disable [--config PATH] [--dry-run] MCP PROJECT
-  mcp-manager move [--config PATH] [--dry-run] MCP PROJECT
-  mcp-manager worktrees enable [--config PATH] [--dry-run] PROJECT
-  mcp-manager worktrees disable [--config PATH] [--dry-run] PROJECT
-  mcp-manager stdio [--config PATH] MCP
-  mcp-manager version
-  mcp-manager help
+Get started in your project directory:
+  mcp-manager project add
+  mcp-manager add docs --url https://example.com/mcp
+  mcp-manager add tools -- npx -y @example/mcp-server
+  mcp-manager list
+  mcp-manager worktrees enable
 
-Every command also accepts --config-local PATH to select the local override
-file, which defaults to the --config path with a .local.json suffix. When that
-file exists, it is applied on top of the central config and receives the
-changes made by import, enable, disable, move, and worktrees.
+MCPs:
+  add NAME --url URL | -- COMMAND [ARGS...]   Define and enable an MCP
+  add NAME --replace ...                    Replace a definition
+  list [--all|--global]                     List MCPs and their scopes
+  show NAME                                Inspect; env/header literals redacted
+  enable NAME [--global]                    Activate a saved MCP
+  disable NAME [--global]                   Deactivate; keep its definition
+  move NAME --global                       Move from this project to global
+  move NAME --local                        Move from global to this project
+  remove NAME                              Delete definition and all assignments
 
-Generated agent configs launch stdio MCPs through "mcp-manager stdio MCP", so
-the mcp-manager binary must be on the PATH that Codex, Claude Code, and
-OpenCode use.`)
+Projects:
+  project add [PATH] [--name ID]            Register a directory (default: here)
+  project list                             List registered projects
+  project show [ID|PATH]                    Show project settings (default: here)
+  project remove [ID|PATH]                  Unregister; retain generated files
+  worktrees enable|disable                 Toggle worktree discovery for here
+
+Other commands:
+  sync                                     Regenerate all managed agent configs
+  import --from AGENT [--local|--global]     Import native config (default: global)
+  stdio NAME                               Launch a saved stdio server
+  version                                  Print the installed version
+
+Local commands infer the project from your current directory, including
+subdirectories and opted-in worktrees. Use --project ID|PATH to select another.
+The legacy "enable|disable|move NAME PROJECT" forms still work.
+Use enable/disable --agent AGENT to change one agent's activation in a scope.
+
+Options may precede or follow arguments. Use -- before a server command.
+--dry-run previews changes; --config PATH and --config-local PATH select configs.
+Existing local override files receive edits. Project registration only changes
+the registry; MCP and worktree changes automatically sync agent configs.
+Run any command with --help for its options.`)
 }

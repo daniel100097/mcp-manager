@@ -173,7 +173,7 @@ func TestWorktreesArgumentsAndHelp(t *testing.T) {
 	}{
 		{[]string{"worktrees"}, 2},
 		{[]string{"worktrees", "unknown"}, 2},
-		{[]string{"worktrees", "enable"}, 2},
+		{[]string{"worktrees", "enable"}, 1},
 		{[]string{"worktrees", "disable", "a", "b"}, 2},
 		{[]string{"worktrees", "enable", "--config", centralPath, "missing"}, 1},
 		{[]string{"worktrees", "--help"}, 0},

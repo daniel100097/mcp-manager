@@ -10,9 +10,10 @@ import (
 )
 
 func printWorktreesUsage(output io.Writer) {
-	fmt.Fprintln(output, `Usage: mcp-manager worktrees enable|disable [options] PROJECT
+	fmt.Fprintln(output, `Usage: mcp-manager worktrees enable|disable [--project ID|PATH] [options]
 
 Enable or disable Git worktree discovery for a registered project's path.
+The current directory selects the project; a positional project is also accepted.
 Enabling synchronizes its current worktrees. Run sync after creating more.
 Disabling stops managing discovered worktrees; existing configs are retained.
 
@@ -44,37 +45,43 @@ func runWorktrees(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	configFlags := addConfigFlags(flags, defaultConfig)
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
+	projectOption := flags.String("project", "", "project ID or path; defaults to the current directory")
 	flags.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: mcp-manager worktrees %s [options] PROJECT\n\nOptions:\n", action)
+		fmt.Fprintf(stderr, "Usage: mcp-manager worktrees %s [--project ID|PATH] [options]\n\nOptions:\n", action)
 		printLongFlagDefaults(stderr, flags)
 	}
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := parseFlags(flags, args[1:]); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
-	if flags.NArg() != 1 {
-		fmt.Fprintf(stderr, "error: worktrees %s requires exactly one project ID\n\n", action)
+	if flags.NArg() > 1 {
+		fmt.Fprintf(stderr, "error: worktrees %s accepts at most one project\n\n", action)
 		flags.Usage()
 		return 2
 	}
-	projectID := flags.Arg(0)
+	selector, err := selectedProject(flags.Arg(0), *projectOption)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
 	source, err := configFlags.source()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	edit, err := source.OpenEdit()
+	edit, err := openConfigEdit(source, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	project, exists := edit.Config.Projects[projectID]
-	if !exists {
-		fmt.Fprintf(stderr, "error: project %q is not registered\n", projectID)
+	projectID, err := resolveProject(edit.Config, selector)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	project := edit.Config.Projects[projectID]
 	enabled := action == "enable"
 	changed := project.IncludeWorktrees != enabled
 	project.IncludeWorktrees = enabled

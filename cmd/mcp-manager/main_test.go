@@ -328,7 +328,7 @@ func TestEnableCommandIsIdempotentAtDestination(t *testing.T) {
 	assertGeneratedTargetsInSync(t, environment, centralPath, got)
 }
 
-func TestEnableCommandRejectsUnknownOrGlobalInputsWithoutWriting(t *testing.T) {
+func TestEnableCommandRejectsUnknownInputsWithoutWriting(t *testing.T) {
 	tests := []struct {
 		name        string
 		mcp         string
@@ -343,10 +343,6 @@ func TestEnableCommandRejectsUnknownOrGlobalInputsWithoutWriting(t *testing.T) {
 		{
 			name: "unknown project", mcp: "tools", project: "missing",
 			wantMessage: []string{"project", "missing"},
-		},
-		{
-			name: "globally active MCP", mcp: "tools", project: "target", global: true,
-			wantMessage: []string{"tools", "global"},
 		},
 	}
 
@@ -513,7 +509,7 @@ func TestDisableCommandKeepsEmptyProjectsAsArray(t *testing.T) {
 	}
 }
 
-func TestDisableCommandRejectsUnknownOrGlobalInputsWithoutWriting(t *testing.T) {
+func TestDisableCommandRejectsUnknownInputsWithoutWriting(t *testing.T) {
 	tests := []struct {
 		name        string
 		mcp         string
@@ -528,10 +524,6 @@ func TestDisableCommandRejectsUnknownOrGlobalInputsWithoutWriting(t *testing.T) 
 		{
 			name: "unknown project", mcp: "tools", project: "missing",
 			wantMessage: []string{"project", "missing"},
-		},
-		{
-			name: "globally active MCP", mcp: "tools", project: "target", global: true,
-			wantMessage: []string{"tools", "global"},
 		},
 	}
 

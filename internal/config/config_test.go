@@ -844,6 +844,156 @@ func TestOpenEditWritesCentralWithoutLocalOverlay(t *testing.T) {
 	}
 }
 
+func TestOpenOrCreateEditPreservesOrphanLocalOverlay(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		local string
+	}{
+		{"empty", `{}`},
+		{"populated", `{"global":{"mcps":["existing"]},"projects":{"api":{"path":"~/missing-api","mcps":["existing"],"includeWorktrees":false}},"mcps":{"existing":{"type":"http","url":"https://example.com/mcp"}}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			source := Source{Path: filepath.Join(home, "central", "config.json"), LocalPath: filepath.Join(home, "overrides", "config.local.json")}
+			writeTestFile(t, source.LocalPath, test.local)
+			edit, err := source.OpenOrCreateEdit()
+			if err != nil {
+				t.Fatalf("OpenOrCreateEdit() error = %v", err)
+			}
+			if !edit.WritesLocal() || edit.Target() != source.LocalPath {
+				t.Fatalf("edit targets %q (local %v)", edit.Target(), edit.WritesLocal())
+			}
+			if test.name == "populated" {
+				if edit.Config.Projects["api"].Path != "~/missing-api" || edit.Config.MCPs["existing"].URL != "https://example.com/mcp" {
+					t.Fatalf("orphan overlay was not applied unchanged: %#v", edit.Config)
+				}
+			}
+			edit.Config.MCPs["added"] = MCP{Type: "stdio", Command: "new-server"}
+			edit.Config.Global.MCPs = append(edit.Config.Global.MCPs, "added")
+			if _, err := os.Stat(source.Path); !os.IsNotExist(err) {
+				t.Fatalf("opening or editing created central config: %v", err)
+			}
+			if got := readTestFile(t, source.LocalPath); got != test.local {
+				t.Fatalf("opening or editing changed overlay: %s", got)
+			}
+			if err := edit.Save(); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+			base, err := Load(source.Path)
+			if err != nil {
+				t.Fatalf("load created central base: %v", err)
+			}
+			if len(base.MCPs) != 0 || len(base.Projects) != 0 || len(base.Global.MCPs) != 0 {
+				t.Fatalf("central base contains local edits: %#v", base)
+			}
+			reloaded, err := source.OpenEdit()
+			if err != nil {
+				t.Fatalf("reload overlay: %v", err)
+			}
+			if !reflect.DeepEqual(reloaded.Config, edit.Config) {
+				t.Fatalf("saved effective config = %#v; want %#v", reloaded.Config, edit.Config)
+			}
+			if !strings.Contains(readTestFile(t, source.LocalPath), `"added"`) {
+				t.Fatal("added MCP was not saved to the overlay")
+			}
+			if err := edit.Save(); err != nil {
+				t.Fatalf("repeated Save() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenOrCreateEditWithoutOverlayCreatesCentralOnSave(t *testing.T) {
+	home := t.TempDir()
+	source := Source{Path: filepath.Join(home, "config.json"), LocalPath: filepath.Join(home, "config.local.json")}
+	edit, err := source.OpenOrCreateEdit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edit.WritesLocal() || len(edit.Config.MCPs) != 0 {
+		t.Fatalf("new edit = %#v", edit)
+	}
+	edit.Config.MCPs["added"] = MCP{Type: "stdio", Command: "server"}
+	edit.Config.Global.MCPs = []string{"added"}
+	if _, err := edit.Effective(); err != nil {
+		t.Fatalf("Effective() before Save(): %v", err)
+	}
+	if _, err := os.Stat(source.Path); !os.IsNotExist(err) {
+		t.Fatalf("Effective() created central config: %v", err)
+	}
+	if err := edit.Save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := source.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.MCPs["added"].Command != "server" {
+		t.Fatalf("saved config = %#v", loaded)
+	}
+	if _, err := os.Stat(source.LocalPath); !os.IsNotExist(err) {
+		t.Fatalf("Save() created unwanted local overlay: %v", err)
+	}
+}
+
+func TestOpenOrCreateEditRejectsInvalidExistingFilesWithoutCreatingBase(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		central string
+		local   string
+	}{
+		{"invalid-overlay-json", "", `{"projects":`},
+		{"invalid-overlay-fields", "", `{"unknown":true}`},
+		{"invalid-central-json", `not json`, `{}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			source := Source{Path: filepath.Join(home, "config.json"), LocalPath: filepath.Join(home, "config.local.json")}
+			if test.central != "" {
+				writeTestFile(t, source.Path, test.central)
+			}
+			writeTestFile(t, source.LocalPath, test.local)
+			if _, err := source.OpenOrCreateEdit(); err == nil {
+				t.Fatal("invalid input was accepted")
+			}
+			if test.central == "" {
+				if _, err := os.Stat(source.Path); !os.IsNotExist(err) {
+					t.Fatalf("failed open created central base: %v", err)
+				}
+			} else if got := readTestFile(t, source.Path); got != test.central {
+				t.Fatalf("invalid central config changed: %s", got)
+			}
+			if got := readTestFile(t, source.LocalPath); got != test.local {
+				t.Fatalf("failed open changed overlay: %s", got)
+			}
+		})
+	}
+}
+
+func TestOpenOrCreateEditRejectsOverlaySymlinkBeforeSavingBase(t *testing.T) {
+	home := t.TempDir()
+	source := Source{Path: filepath.Join(home, "config.json"), LocalPath: filepath.Join(home, "config.local.json")}
+	target := filepath.Join(home, "actual.local.json")
+	writeTestFile(t, target, `{}`)
+	if err := os.Symlink(target, source.LocalPath); err != nil {
+		t.Fatal(err)
+	}
+	edit, err := source.OpenOrCreateEdit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.Save(); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Save() error = %v; want refused symlink", err)
+	}
+	if _, err := os.Stat(source.Path); !os.IsNotExist(err) {
+		t.Fatalf("failed Save() created central base: %v", err)
+	}
+	if got := readTestFile(t, target); got != `{}` {
+		t.Fatalf("failed Save() changed overlay target: %s", got)
+	}
+}
+
 func TestDiffValuesProducesMergePatch(t *testing.T) {
 	var source, target any
 	if err := decodeAny([]byte(`{"a":1,"b":{"c":[1,2],"d":"x"},"e":"gone","f":{"g":true}}`), &source); err != nil {
