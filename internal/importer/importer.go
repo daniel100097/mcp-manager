@@ -921,6 +921,7 @@ func cloneConfig(source *config.Config) *config.Config {
 	for id, project := range source.Projects {
 		project.MCPs = cloneSlice(project.MCPs)
 		project.DisabledAgents = cloneDisabledAgents(project.DisabledAgents)
+		project.DisabledTools = cloneDisabledTools(project.DisabledTools)
 		result.Projects[id] = project
 	}
 	for name, mcp := range source.MCPs {
@@ -938,6 +939,7 @@ func cloneScope(source config.Scope) config.Scope {
 	return config.Scope{
 		MCPs:           cloneSlice(source.MCPs),
 		DisabledAgents: cloneDisabledAgents(source.DisabledAgents),
+		DisabledTools:  cloneDisabledTools(source.DisabledTools),
 	}
 }
 
@@ -1003,4 +1005,15 @@ func sortedKeys[V any](values map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func cloneDisabledTools(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string][]string, len(source))
+	for name, tools := range source {
+		result[name] = cloneSlice(tools)
+	}
+	return result
 }

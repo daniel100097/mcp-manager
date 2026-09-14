@@ -95,7 +95,7 @@ func TestSyncGeneratesAllFormatsAndPreservesOtherSettings(t *testing.T) {
 		t.Fatalf("unexpected Codex stdio server: %#v", filesystem)
 	}
 	remote := nestedMap(t, codexServers, "remote")
-	if got := nestedMap(t, remote, "env_http_headers")["Authorization"]; got != "MCP_AUTH" {
+	if got := remote["env_vars"]; !sliceHasString(got, "MCP_AUTH") {
 		t.Fatalf("Codex env_http_headers Authorization = %#v", got)
 	}
 
@@ -106,7 +106,7 @@ func TestSyncGeneratesAllFormatsAndPreservesOtherSettings(t *testing.T) {
 	claudeServers := nestedMap(t, claude, "mcpServers")
 	assertKeys(t, claudeServers, "remote")
 	claudeRemote := nestedMap(t, claudeServers, "remote")
-	if got := nestedMap(t, claudeRemote, "headers")["Authorization"]; got != "${MCP_AUTH}" {
+	if got := nestedMap(t, claudeRemote, "env")["MCP_AUTH"]; got != "${MCP_AUTH}" {
 		t.Fatalf("Claude Authorization header = %#v", got)
 	}
 
@@ -209,7 +209,7 @@ func TestSyncWrapsStdioServersByDefault(t *testing.T) {
 	if !sliceHasString(codexLocal["env_vars"], "MCP_TOKEN") {
 		t.Fatalf("Codex wrapper entry does not forward envFrom: %#v", codexLocal)
 	}
-	if nestedMap(t, codex, "remote")["url"] != "https://mcp.example.com/v1" {
+	if nestedMap(t, codex, "remote")["command"] != "mcp-manager" {
 		t.Fatalf("Codex http entry changed: %#v", codex["remote"])
 	}
 
@@ -221,7 +221,7 @@ func TestSyncWrapsStdioServersByDefault(t *testing.T) {
 	if env := nestedMap(t, claudeLocal, "env"); !reflect.DeepEqual(env, map[string]any{"MCP_TOKEN": "${MCP_TOKEN}"}) {
 		t.Fatalf("Claude wrapper env = %#v, want only the envFrom reference", env)
 	}
-	if nestedMap(t, claude, "remote")["url"] != "https://mcp.example.com/v1" {
+	if nestedMap(t, claude, "remote")["command"] != "mcp-manager" {
 		t.Fatalf("Claude http entry changed: %#v", claude["remote"])
 	}
 

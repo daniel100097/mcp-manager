@@ -37,11 +37,12 @@ func runMCPAdd(args []string, stdout, stderr io.Writer) int {
 	url := flags.String("url", "", "HTTP MCP server URL")
 	replace := flags.Bool("replace", false, "replace an existing definition, preserving its other scope settings")
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
-	var env, envFrom, headers, headersFrom, disabledAgents mcpStringFlags
+	var env, envFrom, headers, headersFrom, disabledAgents, disabledTools mcpStringFlags
 	flags.Var(&env, "env", "stdio environment KEY=VALUE (repeatable)")
 	flags.Var(&envFrom, "env-from", "stdio environment variable to read at launch (repeatable)")
 	flags.Var(&headers, "header", "HTTP header NAME=VALUE (repeatable)")
 	flags.Var(&headersFrom, "header-from", "HTTP header NAME=ENV_VAR read from the environment (repeatable)")
+	flags.Var(&disabledTools, "disabled-tool", "exact tool name to exclude in this scope (repeatable)")
 	flags.Var(&disabledAgents, "disabled-agent", "agent to exclude in this scope: codex, claude, or opencode (repeatable)")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, `Usage: mcp-manager add NAME [options] -- COMMAND [ARGS...]
@@ -166,6 +167,16 @@ Options:`)
 		}
 		edit.Config.Projects[projectID] = project
 	}
+	if len(disabledTools) > 0 {
+		if err := config.ValidateToolNames(disabledTools); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 2
+		}
+		if _, err := toggleTools(edit.Config, name, projectID, *global, false, disabledTools); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	}
 	action := "add"
 	if exists {
 		action = "replace"
@@ -234,9 +245,11 @@ func runMCPRemove(args []string, stdout, stderr io.Writer) int {
 	delete(edit.Config.MCPs, name)
 	edit.Config.Global.MCPs = removeMCPName(edit.Config.Global.MCPs, name)
 	delete(edit.Config.Global.DisabledAgents, name)
+	delete(edit.Config.Global.DisabledTools, name)
 	for id, project := range edit.Config.Projects {
 		project.MCPs = removeMCPName(project.MCPs, name)
 		delete(project.DisabledAgents, name)
+		delete(project.DisabledTools, name)
 		edit.Config.Projects[id] = project
 	}
 	return saveAndSync(edit, source, true, *dryRun, fmt.Sprintf("remove MCP %q from all scopes", name), stdout, stderr)
@@ -390,12 +403,12 @@ func redactedMCPValues(values map[string]string) map[string]string {
 func mcpScopes(cfg *config.Config, name string) []string {
 	scopes := []string{}
 	if stringIndex(cfg.Global.MCPs, name) >= 0 {
-		scopes = append(scopes, "global"+mcpExclusions(cfg.Global.DisabledAgents[name]))
+		scopes = append(scopes, "global"+mcpExclusions(cfg.Global.DisabledAgents[name])+toolExclusions(cfg.Global.DisabledTools[name]))
 	}
 	projects := []string{}
 	for id, project := range cfg.Projects {
 		if stringIndex(project.MCPs, name) >= 0 {
-			projects = append(projects, "project:"+id+mcpExclusions(project.DisabledAgents[name]))
+			projects = append(projects, "project:"+id+mcpExclusions(project.DisabledAgents[name])+toolExclusions(project.DisabledTools[name]))
 		}
 	}
 	sort.Strings(projects)
@@ -416,4 +429,13 @@ func mcpExclusions(agents []config.Agent) string {
 	}
 	sort.Strings(names)
 	return " (except " + strings.Join(names, ", ") + ")"
+}
+
+func toolExclusions(tools []string) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	names := append([]string(nil), tools...)
+	sort.Strings(names)
+	return " (disabled tools: " + strings.Join(names, ", ") + ")"
 }

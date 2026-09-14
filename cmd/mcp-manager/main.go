@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/daniel100097/mcp-manager/internal/buildinfo"
 	"github.com/daniel100097/mcp-manager/internal/config"
@@ -19,6 +22,9 @@ import (
 // execLaunch hands control to the resolved MCP server. Tests replace it to
 // observe the launch without leaving the test process.
 var execLaunch = wrapper.Exec
+
+var serveStdio = wrapper.ServeStdio
+var serveHTTP = wrapper.ServeHTTP
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -83,7 +89,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "worktrees":
 		return runWorktrees(args[1:], stdout, stderr)
 	case "stdio":
-		return runStdio(args[1:], stderr)
+		return runStdio(args[1:], stdout, stderr)
 	case "version", "--version", "-version":
 		fmt.Fprintln(stdout, buildinfo.String())
 		return 0
@@ -126,10 +132,9 @@ func (f configFlags) source() (config.Source, error) {
 	return config.Source{Path: *f.path, LocalPath: local}, nil
 }
 
-// runStdio launches the named stdio MCP from the central config. It never
-// writes to stdout because that stream carries the MCP protocol once the
-// server starts.
-func runStdio(args []string, stderr io.Writer) int {
+// runStdio exposes the named stdio or HTTP MCP over stdio. Diagnostics go
+// to stderr; stdout is reserved for protocol messages.
+func runStdio(args []string, stdout, stderr io.Writer) int {
 	defaultConfig, err := syncer.DefaultConfigPath()
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -139,6 +144,7 @@ func runStdio(args []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("stdio", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configFlags := addConfigFlags(flags, defaultConfig)
+	projectID := flags.String("project", "", "activation project ID; defaults to global scope")
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: mcp-manager stdio [options] MCP\n\nOptions:\n")
 		printLongFlagDefaults(stderr, flags)
@@ -166,6 +172,31 @@ func runStdio(args []string, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+	disabled, err := cfg.ToolExclusions(mcpName, *projectID)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	mcp := cfg.MCPs[mcpName]
+	if mcp.Type == "http" || len(disabled) > 0 {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		var code int
+		if mcp.Type == "http" {
+			code, err = serveHTTP(ctx, mcp, os.Environ(), disabled, os.Stdin, stdout)
+		} else {
+			var launch wrapper.Launch
+			launch, err = wrapper.Prepare(cfg, mcpName, os.Environ())
+			if err == nil {
+				code, err = serveStdio(ctx, launch, disabled, os.Stdin, stdout, stderr)
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		return code
 	}
 	launch, err := wrapper.Prepare(cfg, mcpName, os.Environ())
 	if err != nil {
@@ -232,6 +263,8 @@ func runScopeCommand(args []string, stdout, stderr io.Writer, command scopeComma
 	global := flags.Bool("global", false, "use global scope; move transfers the selected project's assignment")
 	local := flags.Bool("local", false, "use project scope (default)")
 	agent := flags.String("agent", "", "enable or disable only this agent: codex, claude, or opencode")
+	var tools mcpStringFlags
+	flags.Var(&tools, "tool", "exact tool name to enable or disable in this scope (repeatable)")
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: mcp-manager %s MCP [--project ID|PATH] [--global|--local] [options]\n\nThe current directory selects the project. Legacy MCP PROJECT is also accepted.\n\nOptions:\n", command.name)
 		printLongFlagDefaults(stderr, flags)
@@ -258,6 +291,14 @@ func runScopeCommand(args []string, stdout, stderr io.Writer, command scopeComma
 	}
 	if *global && command.name != "move" && selector != "" {
 		fmt.Fprintln(stderr, "error: --global cannot be combined with a project selector")
+		return 2
+	}
+	if len(tools) > 0 && (command.name == "move" || *agent != "") {
+		fmt.Fprintln(stderr, "error: --tool is supported by enable/disable and cannot be combined with --agent")
+		return 2
+	}
+	if err := config.ValidateToolNames(tools); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 2
 	}
 	if *agent != "" && command.name == "move" {
@@ -294,6 +335,13 @@ func runScopeCommand(args []string, stdout, stderr io.Writer, command scopeComma
 	var changed bool
 	description := fmt.Sprintf("%s MCP %q for project %q", command.name, mcpName, projectID)
 	switch {
+	case len(tools) > 0:
+		changed, err = toggleTools(edit.Config, mcpName, projectID, *global, command.name == "enable", tools)
+		scope := fmt.Sprintf("project %q", projectID)
+		if *global {
+			scope = "global scope"
+		}
+		description = fmt.Sprintf("%s tools %s for MCP %q in %s", command.name, strings.Join(tools, ", "), mcpName, scope)
 	case command.name == "move" && *global:
 		changed, err = moveMCPGlobal(edit.Config, mcpName, projectID)
 		description = fmt.Sprintf("move MCP %q from project %q to global scope", mcpName, projectID)
@@ -313,7 +361,7 @@ func runScopeCommand(args []string, stdout, stderr io.Writer, command scopeComma
 		return 1
 	}
 	code := saveAndSync(edit, source, changed, *dryRun, description, stdout, stderr)
-	if code == 0 && !*global && command.name != "move" && stringIndex(edit.Config.Global.MCPs, mcpName) >= 0 {
+	if code == 0 && len(tools) == 0 && !*global && command.name != "move" && stringIndex(edit.Config.Global.MCPs, mcpName) >= 0 {
 		fmt.Fprintf(stdout, "Global assignment remains active. To restrict MCP %q to this project, use 'mcp-manager move %s --local'.\n", mcpName, mcpName)
 	}
 	return code
@@ -337,6 +385,7 @@ func disableMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 
 	project.MCPs = append(project.MCPs[:mcpIndex], project.MCPs[mcpIndex+1:]...)
 	delete(project.DisabledAgents, mcpName)
+	delete(project.DisabledTools, mcpName)
 	cfg.Projects[projectID] = project
 	return true, nil
 }
@@ -383,10 +432,18 @@ func moveMCP(cfg *config.Config, mcpName, projectID string) (bool, error) {
 	}
 
 	globalDisabledAgents := cfg.Global.DisabledAgents[mcpName]
+	globalDisabledTools := cfg.Global.DisabledTools[mcpName]
 	cfg.Global.MCPs = append(cfg.Global.MCPs[:globalIndex], cfg.Global.MCPs[globalIndex+1:]...)
 	delete(cfg.Global.DisabledAgents, mcpName)
+	delete(cfg.Global.DisabledTools, mcpName)
 	if !alreadyAssigned {
 		project.MCPs = append(project.MCPs, mcpName)
+	}
+	if !alreadyAssigned && len(globalDisabledTools) > 0 {
+		if project.DisabledTools == nil {
+			project.DisabledTools = map[string][]string{}
+		}
+		project.DisabledTools[mcpName] = append([]string(nil), globalDisabledTools...)
 	}
 	if !alreadyAssigned && len(globalDisabledAgents) > 0 {
 		if project.DisabledAgents == nil {
@@ -665,6 +722,8 @@ MCPs:
   show NAME                                Inspect; env/header literals redacted
   enable NAME [--global]                    Activate a saved MCP
   disable NAME [--global]                   Deactivate; keep its definition
+  disable NAME --tool TOOL [--global]       Hide and block one tool in a scope
+  enable NAME --tool TOOL [--global]        Restore one tool in a scope
   move NAME --global                       Move from this project to global
   move NAME --local                        Move from global to this project
   remove NAME                              Delete definition and all assignments
@@ -679,7 +738,7 @@ Projects:
 Other commands:
   sync                                     Regenerate all managed agent configs
   import --from AGENT [--local|--global]     Import native config (default: global)
-  stdio NAME                               Launch a saved stdio server
+  stdio NAME                               Relay a saved stdio or HTTP server
   version                                  Print the installed version
 
 Local commands infer the project from your current directory, including

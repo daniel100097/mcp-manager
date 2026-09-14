@@ -197,9 +197,6 @@ func newRenderSettings(cfg *config.Config, options Options) (renderSettings, err
 		lookupEnv:     options.LookupEnv,
 		wrapStdio:     cfg.Options.WrapStdio(),
 	}
-	if !settings.wrapStdio {
-		return settings, nil
-	}
 	configPath := filepath.Clean(StandardConfigPath(options.UserConfigDir))
 	if options.ConfigPath != "" {
 		absolute, err := filepath.Abs(options.ConfigPath)
@@ -309,9 +306,11 @@ func rejectTargetCollisions(targets []target) error {
 func renderServers(cfg *config.Config, agent config.Agent, projectID string, settings renderSettings) (map[string]any, error) {
 	var names []string
 	var disabledAgents map[string][]config.Agent
+	var disabledTools map[string][]string
 	if projectID == "" {
 		names = append(names, cfg.Global.MCPs...)
 		disabledAgents = cfg.Global.DisabledAgents
+		disabledTools = cfg.Global.DisabledTools
 	} else {
 		project, exists := cfg.Projects[projectID]
 		if !exists {
@@ -319,6 +318,7 @@ func renderServers(cfg *config.Config, agent config.Agent, projectID string, set
 		}
 		names = append(names, project.MCPs...)
 		disabledAgents = project.DisabledAgents
+		disabledTools = project.DisabledTools
 	}
 	sort.Strings(names)
 
@@ -331,7 +331,7 @@ func renderServers(cfg *config.Config, agent config.Agent, projectID string, set
 		if agentDisabled(disabledAgents[name], agent) {
 			continue
 		}
-		server, err := renderServer(name, mcp, agent, settings)
+		server, err := renderServer(name, mcp, agent, settings, projectID, disabledTools[name])
 		if err != nil {
 			return nil, err
 		}
@@ -340,18 +340,30 @@ func renderServers(cfg *config.Config, agent config.Agent, projectID string, set
 	return servers, nil
 }
 
-// wrapStdio replaces the real command line of a stdio MCP with the
-// mcp-manager wrapper. Literal env values stay in the central config because
-// the wrapper applies them at launch; envFrom is kept so that each agent still
-// forwards those variables to the wrapper process.
-func wrapStdio(name string, mcp config.MCP, settings renderSettings) config.MCP {
-	if !settings.wrapStdio || mcp.Type != "stdio" {
+// wrapServer keeps HTTP connections and tool filtering in the manager. Direct
+// stdio mode remains available only for assignments without tool exclusions.
+func wrapServer(name string, mcp config.MCP, settings renderSettings, projectID string, disabled []string) config.MCP {
+	if mcp.Type == "stdio" && !settings.wrapStdio && len(disabled) == 0 {
 		return mcp
 	}
-	wrapped := mcp
-	wrapped.Command = wrapper.Command
-	wrapped.Args = wrapper.Args(name, settings.wrapperConfig, settings.wrapperLocalConfig)
-	wrapped.Env = nil
+	wrapped := config.MCP{
+		Type: "stdio", Command: wrapper.Command,
+		Args:    wrapper.Args(name, settings.wrapperConfig, settings.wrapperLocalConfig, projectID),
+		EnvFrom: append([]string(nil), mcp.EnvFrom...),
+	}
+	// Resolve literal headers in the manager; forward referenced variables in
+	// each agent's native stdio environment syntax (including Codex env_vars).
+	seen := map[string]bool{}
+	for _, variable := range wrapped.EnvFrom {
+		seen[variable] = true
+	}
+	for _, variable := range mcp.HeadersFrom {
+		if !seen[variable] {
+			wrapped.EnvFrom = append(wrapped.EnvFrom, variable)
+			seen[variable] = true
+		}
+	}
+	sort.Strings(wrapped.EnvFrom)
 	return wrapped
 }
 
@@ -369,8 +381,10 @@ func renderServer(
 	mcp config.MCP,
 	agent config.Agent,
 	settings renderSettings,
+	projectID string,
+	disabled []string,
 ) (map[string]any, error) {
-	mcp = wrapStdio(name, mcp, settings)
+	mcp = wrapServer(name, mcp, settings, projectID, disabled)
 	environment := cloneMap(mcp.Env)
 	headers := cloneMap(mcp.Headers)
 

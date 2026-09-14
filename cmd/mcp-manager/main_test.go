@@ -679,7 +679,6 @@ func TestStdioCommandRejectsInvalidLaunchesWithoutExecuting(t *testing.T) {
 		{name: "missing name", args: []string{}, wantCode: 2, wantErr: "exactly one MCP name"},
 		{name: "too many names", args: []string{"tools", "other-mcp"}, wantCode: 2, wantErr: "exactly one MCP name"},
 		{name: "unknown MCP", args: []string{"missing"}, wantCode: 1, wantErr: `MCP "missing" does not exist`},
-		{name: "http MCP", args: []string{"other-mcp"}, wantCode: 1, wantErr: "only stdio MCPs can be launched"},
 		{name: "unset envFrom", args: []string{"tools"}, unsetEnv: "TOOLS_TOKEN", wantCode: 1, wantErr: `requires environment variable "TOOLS_TOKEN"`},
 	}
 	for _, test := range tests {

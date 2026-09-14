@@ -63,15 +63,17 @@ func (o Options) WrapStdio() bool {
 }
 
 type Scope struct {
-	MCPs           []string           `json:"mcps"`
-	DisabledAgents map[string][]Agent `json:"disabledAgents,omitempty"`
+	MCPs           []string            `json:"mcps"`
+	DisabledAgents map[string][]Agent  `json:"disabledAgents,omitempty"`
+	DisabledTools  map[string][]string `json:"disabledTools,omitempty"`
 }
 
 type Project struct {
-	Path             string             `json:"path"`
-	IncludeWorktrees bool               `json:"includeWorktrees,omitempty"`
-	MCPs             []string           `json:"mcps"`
-	DisabledAgents   map[string][]Agent `json:"disabledAgents,omitempty"`
+	Path             string              `json:"path"`
+	IncludeWorktrees bool                `json:"includeWorktrees,omitempty"`
+	MCPs             []string            `json:"mcps"`
+	DisabledAgents   map[string][]Agent  `json:"disabledAgents,omitempty"`
+	DisabledTools    map[string][]string `json:"disabledTools,omitempty"`
 }
 
 type MCP struct {
@@ -842,7 +844,7 @@ func (c *Config) validateStatic(home string) error {
 			return err
 		}
 	}
-	if err := validateScope("global scope", c.Global.MCPs, c.Global.DisabledAgents, c.MCPs); err != nil {
+	if err := validateScope("global scope", c.Global.MCPs, c.Global.DisabledAgents, c.Global.DisabledTools, c.MCPs); err != nil {
 		return err
 	}
 
@@ -858,6 +860,7 @@ func (c *Config) validateStatic(home string) error {
 			fmt.Sprintf("project %q", id),
 			project.MCPs,
 			project.DisabledAgents,
+			project.DisabledTools,
 			c.MCPs,
 		); err != nil {
 			return err
@@ -981,6 +984,7 @@ func validateScope(
 	label string,
 	names []string,
 	disabledAgents map[string][]Agent,
+	disabledTools map[string][]string,
 	definitions map[string]MCP,
 ) error {
 	active := make(map[string]struct{}, len(names))
@@ -1005,7 +1009,47 @@ func validateScope(
 			return err
 		}
 	}
+	for _, name := range sortedKeys(disabledTools) {
+		if _, enabled := active[name]; !enabled {
+			return fmt.Errorf("%s disabledTools key %q is not active in that scope", label, name)
+		}
+		if err := ValidateToolNames(disabledTools[name]); err != nil {
+			return fmt.Errorf("%s MCP %q disabledTools: %w", label, name, err)
+		}
+	}
 	return nil
+}
+
+// ValidateToolNames validates exact MCP tool names without restricting them to
+// the manager's more limited server/project identifier syntax.
+func ValidateToolNames(names []string) error {
+	seen := map[string]bool{}
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" || strings.ContainsAny(name, "\x00\r\n") {
+			return fmt.Errorf("invalid tool name %q", name)
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate tool name %q", name)
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+// ToolExclusions selects one activation's policy, just like disabledAgents.
+// Project policies are independent of the global assignment's policy.
+func (c *Config) ToolExclusions(name, projectID string) ([]string, error) {
+	if _, exists := c.MCPs[name]; !exists {
+		return nil, fmt.Errorf("MCP %q does not exist", name)
+	}
+	if projectID == "" {
+		return c.Global.DisabledTools[name], nil
+	}
+	project, exists := c.Projects[projectID]
+	if !exists {
+		return nil, fmt.Errorf("project %q is not registered", projectID)
+	}
+	return project.DisabledTools[name], nil
 }
 
 func validateAgentList(label string, agents []Agent) error {
@@ -1173,21 +1217,22 @@ func validateRequiredScopeFields(label string, scope map[string]json.RawMessage)
 	if firstJSONByte(scope["mcps"]) != '[' {
 		return fmt.Errorf("%s field %q must be an array", label, "mcps")
 	}
-	rawDisabledAgents, exists := scope["disabledAgents"]
-	if !exists {
-		return nil
-	}
-	if firstJSONByte(rawDisabledAgents) != '{' {
-		return fmt.Errorf("%s field %q must be an object", label, "disabledAgents")
-	}
-
-	var disabledAgents map[string]json.RawMessage
-	if err := json.Unmarshal(rawDisabledAgents, &disabledAgents); err != nil {
-		return fmt.Errorf("%s field %q must be an object", label, "disabledAgents")
-	}
-	for name, rawAgents := range disabledAgents {
-		if firstJSONByte(rawAgents) != '[' {
-			return fmt.Errorf("%s disabledAgents for MCP %q must be an array", label, name)
+	for _, field := range []string{"disabledAgents", "disabledTools"} {
+		raw, exists := scope[field]
+		if !exists {
+			continue
+		}
+		if firstJSONByte(raw) != '{' {
+			return fmt.Errorf("%s field %q must be an object", label, field)
+		}
+		var exclusions map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &exclusions); err != nil {
+			return err
+		}
+		for name, list := range exclusions {
+			if firstJSONByte(list) != '[' {
+				return fmt.Errorf("%s %s for MCP %q must be an array", label, field, name)
+			}
 		}
 	}
 	return nil

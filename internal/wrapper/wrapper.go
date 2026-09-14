@@ -1,7 +1,6 @@
-// Package wrapper implements the "mcp-manager stdio NAME" launcher. Generated
-// agent configs reference stdio MCPs through this wrapper so that the real
-// command, arguments, and environment are resolved from the central config
-// every time an agent starts the server.
+// Package wrapper implements "mcp-manager stdio NAME" for local and HTTP
+// MCPs. It resolves central definitions at connection startup and filters
+// disabled tools while relaying messages between the agent and server.
 package wrapper
 
 import (
@@ -20,7 +19,7 @@ import (
 // resolve it through their PATH.
 const Command = "mcp-manager"
 
-// Subcommand is the mcp-manager subcommand that launches a stdio MCP.
+// Subcommand exposes either upstream transport to the agent over stdio.
 const Subcommand = "stdio"
 
 // Launch describes a fully resolved stdio MCP process.
@@ -43,7 +42,7 @@ const (
 // Args returns the arguments that make mcp-manager launch the named MCP. Empty
 // configPath and localConfigPath values select the wrapper's default
 // locations at launch time.
-func Args(name, configPath, localConfigPath string) []string {
+func Args(name, configPath, localConfigPath string, projectID ...string) []string {
 	args := []string{Subcommand}
 	if configPath != "" {
 		args = append(args, "--"+ConfigFlag, configPath)
@@ -51,13 +50,16 @@ func Args(name, configPath, localConfigPath string) []string {
 	if localConfigPath != "" {
 		args = append(args, "--"+LocalConfigFlag, localConfigPath)
 	}
+	if len(projectID) > 0 && projectID[0] != "" {
+		args = append(args, "--project", projectID[0])
+	}
 	return append(args, name)
 }
 
 // Parse recognizes a command line produced by Args and returns the wrapped MCP
 // name. It accepts the bare command name or any path whose final element is
 // mcp-manager, optionally with a Windows .exe suffix, followed by the stdio
-// subcommand, any --config and --config-local options, and exactly one MCP
+// subcommand, any --config, --config-local and --project options, and one MCP
 // name.
 func Parse(command string, args []string) (string, bool) {
 	if !isWrapperCommand(command) || len(args) == 0 || args[0] != Subcommand {
@@ -67,7 +69,7 @@ func Parse(command string, args []string) (string, bool) {
 	for len(rest) > 0 && strings.HasPrefix(rest[0], "-") {
 		option := strings.TrimPrefix(strings.TrimPrefix(rest[0], "-"), "-")
 		flagName, _, inline := strings.Cut(option, "=")
-		if flagName != ConfigFlag && flagName != LocalConfigFlag {
+		if flagName != ConfigFlag && flagName != LocalConfigFlag && flagName != "project" {
 			return "", false
 		}
 		if inline {

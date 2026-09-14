@@ -5,10 +5,10 @@ the MCP sections used by Codex, Claude Code, and OpenCode. The central file,
 optionally combined with a machine-specific local override file, is the sole
 source of truth; agent configs are generated outputs. It supports local
 `stdio` servers, remote streamable HTTP servers, global activation,
-per-project activation, per-scope agent exclusions, and optional secret
-materialization. Generated `stdio` entries launch `mcp-manager stdio NAME`,
-so agents always start local servers through `mcp-manager` and pick up the
-central definition at launch time.
+per-project activation, per-scope agent and tool exclusions, and optional
+secret materialization. Generated entries launch `mcp-manager stdio NAME`
+for both local and HTTP servers, resolving the central definition at launch.
+The manager hides disabled tools from discovery and blocks calls to them.
 
 ## Build and install
 
@@ -90,6 +90,8 @@ to keep its flags separate from manager flags.
 | Make a global MCP local to this project | `mcp-manager move docs --local` |
 | Disable one agent in this scope | `mcp-manager disable docs --agent claude` |
 | Enable that agent again | `mcp-manager enable docs --agent claude` |
+| Hide and block one tool here | `mcp-manager disable docs --tool delete_record` |
+| Restore that tool | `mcp-manager enable docs --tool delete_record` |
 | Delete an MCP definition and all its assignments | `mcp-manager remove docs` |
 | Enable worktree discovery here | `mcp-manager worktrees enable` |
 
@@ -195,6 +197,37 @@ into another project.
 The previous positional forms, such as `enable NAME PROJECT`,
 `disable NAME PROJECT`, and `move NAME PROJECT`, remain accepted.
 
+### Disable individual tools
+
+Tool exclusions apply to all agents using the selected MCP assignment, for
+both stdio and streamable HTTP servers:
+
+```bash
+mcp-manager disable github --tool delete_repository
+mcp-manager disable github --global --tool delete_repository --tool delete_file
+mcp-manager enable github --tool delete_repository
+mcp-manager add files --disabled-tool write_file -- npx -y @modelcontextprotocol/server-filesystem .
+```
+
+`--tool` is repeatable and accepts exact server tool names, without an agent's
+MCP prefix. It does not expand wildcards. The MCP must already be active in
+the selected scope; use `--global` to edit a global assignment. These commands
+preserve server activation and the other tools. `--tool` cannot be combined
+with `--agent`; tool exclusions apply to every agent in that scope.
+
+The manager removes excluded tools from every `tools/list` page and rejects
+`tools/call` requests for them, even if a client retained an older tool list.
+Other protocol messages, including server requests and tool-list change
+notifications, pass through. Exclusions are loaded at connection startup:
+**restart or reconnect the MCP after changing them**. CLI changes sync the
+agent configs automatically; run `sync` after editing JSON by hand.
+
+`show` and `list` display exclusions alongside the assignment. Moving an
+assignment carries its tool exclusions unless the destination already has
+an assignment, whose settings take precedence. Removing or disabling an
+assignment removes its tool exclusions. Worktrees inherit their owner's
+policy. Existing local override files receive CLI edits as usual.
+
 ## Central configuration reference
 
 The CLI creates and updates this configuration for you. You can also edit it
@@ -255,6 +288,23 @@ outputs, while `projects.<id>.disabledAgents` controls only that project's
 outputs. Every map key must also appear in that scope's `mcps` list. This
 allows the same transport to have different agent exclusions in different
 scopes.
+
+Each scope also accepts `disabledTools`, with active MCP names mapped to arrays
+of exact tool names. For example:
+
+```json
+{
+  "global": {
+    "mcps": ["docs"],
+    "disabledTools": {"docs": ["delete_record"]}
+  }
+}
+```
+
+This is a fragment of the central configuration. Project assignments have
+independent `disabledTools` maps, just as they have independent
+`disabledAgents` maps. Project wrapper entries carry `--project ID` so the
+manager selects that assignment's policy, including in inherited worktrees.
 
 The complete machine-readable definition is in
 [`mcp-manager.schema.json`](./mcp-manager.schema.json), with a ready-to-edit
@@ -337,7 +387,7 @@ You can also edit `includeWorktrees` in JSON and run `mcp-manager sync`.
 
 An enabled project's `path` must be a Git repository or worktree root. During
 each sync, `git worktree list --porcelain -z` discovers its worktrees, which
-inherit the project's `mcps` and `disabledAgents`. Bare entries and missing or
+inherit the project's `mcps`, `disabledAgents`, and `disabledTools`. Bare entries and missing or
 prunable worktree entries are skipped. A worktree registered as its
 own project uses that project's settings. If multiple enabled projects would
 supply settings to the same unregistered worktree, sync fails; enable discovery
@@ -350,75 +400,67 @@ worktrees but does not delete their previously generated files. MCP commands,
 arguments, and environment values are inherited unchanged, including any
 absolute paths in server definitions.
 
-## Launching stdio servers through mcp-manager
+## Connecting through mcp-manager
 
-By default, every generated `stdio` entry runs the `mcp-manager` binary
-instead of the server's real command:
+By default, generated entries for **both stdio and HTTP servers** run the
+`mcp-manager` binary. For example, this Claude entry can refer to either
+transport in the central config:
 
 ```json
 {
   "mcpServers": {
-    "filesystem": {
+    "docs": {
       "type": "stdio",
       "command": "mcp-manager",
-      "args": ["stdio", "filesystem"],
-      "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}
+      "args": ["stdio", "docs"],
+      "env": {"MCP_TOKEN": "${MCP_TOKEN}"}
     }
   }
 }
 ```
 
-When an agent starts the server, `mcp-manager stdio filesystem` loads the
-central config, looks up the transport definition, applies its literal `env`
-values, checks that every `envFrom` variable is present in the environment,
-and replaces itself with the real command through `exec`. The agent therefore
-talks to the server process directly, signals and the exit status pass through
-unchanged, and stdout is never touched by `mcp-manager`; diagnostics go to
-stderr only. On Windows, where `exec` is unavailable, the wrapper stays
-running as the parent process, relays the standard streams, and exits with
-the server's exit code.
+For stdio servers, the manager resolves the command and environment at
+startup. With tool exclusions it stays running and relays JSON-RPC messages
+through the filter, forwarding stderr separately and preserving the child's
+exit code. Without exclusions, Unix keeps the existing `exec` launch path;
+Windows runs the child and relays its standard streams.
 
-Because the real command, arguments, and literal environment are resolved at
-launch, editing them in the central config takes effect the next time an
-agent starts the server, without running `sync`. Renaming, adding, removing,
-or re-scoping an MCP still requires `sync`, as does changing `envFrom`.
+For HTTP servers, the manager bridges the agent's stdio connection to the
+configured streamable HTTP endpoint. It forwards the initialization handshake,
+capabilities, requests and notifications, negotiates session/protocol headers,
+handles JSON and SSE responses, and listens for server messages on the optional
+GET stream. Interrupted SSE streams resume with `Last-Event-ID` when available;
+POST calls are not replayed. Shutdown cancels requests and attempts to delete
+the HTTP session. Configure HTTP authentication through `headers` or
+`headersFrom`; the bridge does not use the agents' native HTTP OAuth logins.
+Legacy HTTP+SSE endpoints are not supported; use a streamable HTTP endpoint.
 
 Requirements and details:
 
-- The `mcp-manager` binary must be on the `PATH` used by Codex, Claude Code,
-  and OpenCode. The build instructions above install it to `~/.local/bin`.
-- When `sync` runs with a config outside the default location, whether through
-  `--config` or `MCP_MANAGER_CONFIG`, the generated entries include
-  `--config /absolute/path` so the wrapper reads the same file. A local
-  override file outside its default location is embedded as `--config-local`
-  in the same way.
-- `envFrom` references are still generated in each agent's native form so the
-  agent forwards those variables to the wrapper. Codex in particular starts
-  MCP servers with a minimal environment and only passes the variables listed
-  in `env_vars`. Literal `env` values are not written to agent configs.
-- `--inline-secrets` still writes resolved `envFrom` values into agent configs;
-  the wrapper inherits them from the agent and forwards them to the server.
-- `import` recognizes generated wrapper entries and maps them back to the
-  central definition, so importing an agent config after a `sync` reports the
-  MCPs as unchanged. A wrapper entry whose name is not defined in the central
-  config is an error.
-- `mcp-manager stdio NAME` works for every defined `stdio` MCP, whether or not
-  it is activated in a scope, which makes it a convenient way to test a server
-  definition by hand.
+- The installed `mcp-manager` binary must be on each agent's `PATH`. After
+  upgrading from a version that emitted direct HTTP entries, run `sync` and
+  reconnect the MCPs to route them through the manager.
+- Custom central and local config paths are embedded as `--config` and
+  `--config-local`. Project entries also include `--project ID`.
+- Literal stdio environment values and HTTP headers are resolved centrally
+  at launch. Referenced variables are forwarded using each agent's native
+  stdio environment syntax. Missing variables fail startup before connection.
+- `--inline-secrets` writes the referenced variables' values into the generated
+  environment. Literal HTTP headers remain in the central definition.
+- `import` recognizes wrappers for either transport and restores the original
+  central definition, preserving existing scope policies. Importing a generated
+  config back into its scope after sync reports the MCPs as unchanged.
+- Diagnostics go to stderr; stdout carries only the MCP protocol.
 
-To write the real command line into agent configs instead, set the option in
-the central config:
+Changes to commands, URLs, literal environment values and headers take effect
+on the next connection without sync. Renaming, adding, removing, re-scoping,
+or changing referenced variables requires sync. Sync tool changes too, since
+adding exclusions may need to switch an entry from direct mode to a wrapper.
 
-```json
-{
-  "options": {
-    "stdioMode": "direct"
-  }
-}
-```
-
-`stdioMode` accepts `wrapper` (default) or `direct`. HTTP servers are never
-wrapped; their entries are generated the same way in both modes.
+`options.stdioMode` accepts `wrapper` (default) or `direct`. Direct mode writes
+the real command only for stdio assignments with no tool exclusions. An
+assignment with exclusions always uses the filtering wrapper. **HTTP servers
+always use the manager**, including in direct stdio mode.
 
 ## Generated files
 
@@ -447,14 +489,14 @@ original formatting inside an existing generated file can be lost.
 
 Use `env` and `headers` for literal strings. Use `envFrom` to forward named
 environment variables to a `stdio` server and `headersFrom` to map HTTP header
-names to environment variables. In the default wrapper mode, literal `env`
-values stay in the central config and are applied by `mcp-manager stdio` at
-launch. Without inline mode, the generator emits each agent's native reference
-form for `envFrom` and `headersFrom`:
+names to environment variables. Wrapped servers resolve literal values in
+the central config at launch. HTTP header references are forwarded as
+environment variables, then mapped to headers by the manager. Without inline
+mode, the generated references use these forms:
 
 | Target | `envFrom` | `headersFrom` |
 | --- | --- | --- |
-| Codex | `env_vars` | `env_http_headers` |
+| Codex | `env_vars` | `env_vars` |
 | Claude Code | `${VARIABLE}` | `${VARIABLE}` |
 | OpenCode | `{env:VARIABLE}` | `{env:VARIABLE}` |
 
@@ -509,18 +551,17 @@ source agent; configure any `disabledAgents` entries in their intended scope.
 Literal credentials already present in a native config remain literal when
 imported. Review the central file before committing it.
 
-## Launch a stdio MCP by hand
+## Connect to an MCP by hand
 
 ```bash
-mcp-manager stdio [--config PATH] MCP
+mcp-manager stdio [--config PATH] [--project ID] MCP
 ```
 
-This is the command that generated agent configs run. It resolves the named
-`stdio` MCP from the central config and replaces itself with the server
-process, so it can be used to test a definition interactively or from another
-MCP client. It fails before launching anything when the MCP is unknown, uses
-the `http` transport, lists an `envFrom` variable that is not set, or names a
-command that cannot be found on the `PATH`.
+This exposes any defined stdio or HTTP MCP over stdio using the same path
+as generated agent configs. Without `--project` it applies the global tool
+policy. It can also launch definitions without an assignment for testing.
+Unknown MCPs/projects, missing referenced environment variables, and missing
+stdio executables fail before the connection starts.
 
 ## Development and releases
 

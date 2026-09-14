@@ -27,6 +27,12 @@
         "workspace-files": [
           "claude"
         ]
+      },
+      "disabledTools": {
+        "workspace-files": [
+          "write_file",
+          "edit_file"
+        ]
       }
     }
   },

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"reflect"
+	"sort"
 
 	"github.com/daniel100097/mcp-manager/internal/config"
 )
@@ -28,8 +29,15 @@ func moveMCPGlobal(cfg *config.Config, name, projectID string) (bool, error) {
 	if !global && len(project.DisabledAgents[name]) > 0 {
 		cfg.Global.DisabledAgents[name] = append([]config.Agent(nil), project.DisabledAgents[name]...)
 	}
+	if !global && len(project.DisabledTools[name]) > 0 {
+		if cfg.Global.DisabledTools == nil {
+			cfg.Global.DisabledTools = map[string][]string{}
+		}
+		cfg.Global.DisabledTools[name] = append([]string(nil), project.DisabledTools[name]...)
+	}
 	project.MCPs = append(project.MCPs[:index], project.MCPs[index+1:]...)
 	delete(project.DisabledAgents, name)
+	delete(project.DisabledTools, name)
 	cfg.Projects[projectID] = project
 	return true, nil
 }
@@ -38,7 +46,7 @@ func toggleMCPScope(cfg *config.Config, name, projectID string, global, enabled 
 	scope := cfg.Global
 	if !global {
 		project := cfg.Projects[projectID]
-		scope = config.Scope{MCPs: project.MCPs, DisabledAgents: project.DisabledAgents}
+		scope = config.Scope{MCPs: project.MCPs, DisabledAgents: project.DisabledAgents, DisabledTools: project.DisabledTools}
 	}
 	beforeNames := append([]string{}, scope.MCPs...)
 	beforeExclusions := append([]config.Agent{}, scope.DisabledAgents[name]...)
@@ -52,6 +60,7 @@ func toggleMCPScope(cfg *config.Config, name, projectID string, global, enabled 
 		} else if !enabled && index >= 0 {
 			scope.MCPs = append(scope.MCPs[:index], scope.MCPs[index+1:]...)
 			delete(scope.DisabledAgents, name)
+			delete(scope.DisabledTools, name)
 		}
 	} else if enabled {
 		if index < 0 {
@@ -87,8 +96,52 @@ func toggleMCPScope(cfg *config.Config, name, projectID string, global, enabled 
 		cfg.Global = scope
 	} else {
 		project := cfg.Projects[projectID]
-		project.MCPs, project.DisabledAgents = scope.MCPs, scope.DisabledAgents
+		project.MCPs, project.DisabledAgents, project.DisabledTools = scope.MCPs, scope.DisabledAgents, scope.DisabledTools
 		cfg.Projects[projectID] = project
 	}
 	return changed, nil
+}
+
+// Tool changes preserve activation and affect all agents using this assignment.
+func toggleTools(cfg *config.Config, name, projectID string, global, enabled bool, tools []string) (bool, error) {
+	scope := cfg.Global
+	if !global {
+		project := cfg.Projects[projectID]
+		scope = config.Scope{MCPs: project.MCPs, DisabledAgents: project.DisabledAgents, DisabledTools: project.DisabledTools}
+	}
+	if stringIndex(scope.MCPs, name) < 0 {
+		return false, fmt.Errorf("MCP %q is not active in the selected scope; enable it there first or use --global for a global assignment", name)
+	}
+	before := append([]string{}, scope.DisabledTools[name]...)
+	after := append([]string{}, before...)
+	for _, tool := range tools {
+		index := stringIndex(after, tool)
+		if enabled && index >= 0 {
+			after = append(after[:index], after[index+1:]...)
+		}
+		if !enabled && index < 0 {
+			after = append(after, tool)
+		}
+	}
+	sort.Strings(before)
+	sort.Strings(after)
+	if reflect.DeepEqual(before, after) {
+		return false, nil
+	}
+	if scope.DisabledTools == nil {
+		scope.DisabledTools = map[string][]string{}
+	}
+	if len(after) == 0 {
+		delete(scope.DisabledTools, name)
+	} else {
+		scope.DisabledTools[name] = after
+	}
+	if global {
+		cfg.Global = scope
+	} else {
+		project := cfg.Projects[projectID]
+		project.DisabledTools = scope.DisabledTools
+		cfg.Projects[projectID] = project
+	}
+	return true, nil
 }
