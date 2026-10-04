@@ -184,6 +184,19 @@ func wrapperTestConfig() *config.Config {
 	}
 }
 
+func TestSyncForwardsURLVariableToWrapper(t *testing.T) {
+	options := testOptions(t, t.TempDir())
+	cfg := wrapperTestConfig()
+	cfg.MCPs["remote"] = config.MCP{Type: "sse", URLFrom: "REMOTE_URL", HeadersFrom: map[string]string{"Authorization": "TOKEN"}}
+	if _, err := Sync(cfg, options); err != nil {
+		t.Fatal(err)
+	}
+	remote := nestedMap(t, readTOML(t, filepath.Join(options.HomeDir, ".codex", "config.toml")), "mcp_servers", "remote")
+	if !reflect.DeepEqual(remote["env_vars"], []any{"REMOTE_URL", "TOKEN"}) {
+		t.Fatalf("forwarded variables = %#v", remote)
+	}
+}
+
 func TestSyncWrapsStdioServersByDefault(t *testing.T) {
 	options := testOptions(t, t.TempDir())
 	options.ConfigPath = StandardConfigPath(options.UserConfigDir)

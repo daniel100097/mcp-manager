@@ -83,6 +83,7 @@ type MCP struct {
 	Env         map[string]string `json:"env,omitempty"`
 	EnvFrom     []string          `json:"envFrom,omitempty"`
 	URL         string            `json:"url,omitempty"`
+	URLFrom     string            `json:"urlFrom,omitempty"`
 	Headers     map[string]string `json:"headers,omitempty"`
 	HeadersFrom map[string]string `json:"headersFrom,omitempty"`
 }
@@ -957,25 +958,40 @@ func validateMCP(name string, mcp MCP) error {
 		if strings.ContainsRune(mcp.Command, '\x00') {
 			return fmt.Errorf("MCP %q: stdio command contains a NUL byte", name)
 		}
-		if mcp.URL != "" || len(mcp.Headers) != 0 || len(mcp.HeadersFrom) != 0 {
-			return fmt.Errorf("MCP %q: stdio transport cannot set url, headers, or headersFrom", name)
+		if mcp.URL != "" || mcp.URLFrom != "" || len(mcp.Headers) != 0 || len(mcp.HeadersFrom) != 0 {
+			return fmt.Errorf("MCP %q: stdio transport cannot set url, urlFrom, headers, or headersFrom", name)
 		}
 		if err := validateEnvironment(name, mcp.Env, mcp.EnvFrom); err != nil {
 			return err
 		}
-	case "http":
+	case "http", "sse":
 		if mcp.Command != "" || len(mcp.Args) != 0 || len(mcp.Env) != 0 || len(mcp.EnvFrom) != 0 {
-			return fmt.Errorf("MCP %q: http transport cannot set command, args, env, or envFrom", name)
+			return fmt.Errorf("MCP %q: %s transport cannot set command, args, env, or envFrom", name, mcp.Type)
 		}
-		parsed, err := url.Parse(mcp.URL)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return fmt.Errorf("MCP %q: url must be an absolute http or https URL", name)
+		if mcp.URLFrom != "" {
+			if mcp.URL != "" {
+				return fmt.Errorf("MCP %q: set either url or urlFrom, not both", name)
+			}
+			if !envPattern.MatchString(mcp.URLFrom) {
+				return fmt.Errorf("MCP %q has invalid urlFrom environment variable %q", name, mcp.URLFrom)
+			}
+		} else if err := ValidateURL(mcp.URL); err != nil {
+			return fmt.Errorf("MCP %q: %w", name, err)
 		}
 		if err := validateHeaders(name, mcp.Headers, mcp.HeadersFrom); err != nil {
 			return err
 		}
 	default:
-		return fmt.Errorf("MCP %q: type must be either %q or %q", name, "stdio", "http")
+		return fmt.Errorf("MCP %q: type must be %q, %q, or %q", name, "stdio", "http", "sse")
+	}
+	return nil
+}
+
+// ValidateURL checks a remote MCP URL. A urlFrom value is checked at launch.
+func ValidateURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("url must be an absolute http or https URL")
 	}
 	return nil
 }

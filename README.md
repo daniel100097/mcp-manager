@@ -4,7 +4,7 @@
 the MCP sections used by Codex, Claude Code, and OpenCode. The central file,
 optionally combined with a machine-specific local override file, is the sole
 source of truth; agent configs are generated outputs. It supports local
-`stdio` servers, remote streamable HTTP servers, global activation,
+`stdio` servers, remote streamable HTTP and SSE servers, global activation,
 per-project activation, per-scope agent and tool exclusions, and optional
 secret materialization. Generated entries launch `mcp-manager stdio NAME`
 for both local and HTTP servers, resolving the central definition at launch.
@@ -139,6 +139,15 @@ Repeat `--env KEY=VALUE` for literal stdio environment values and
 repeat `--header KEY=VALUE` for literal headers and
 `--header-from HEADER=ENV` for environment references. Prefer environment
 references for credentials so they do not appear in shell history.
+
+Use `--url-from ENV` instead of `--url` to read the URL from an environment
+variable when the server launches, for example when it embeds a token or
+differs per machine. Add `--sse` for servers that only offer the legacy
+HTTP+SSE transport:
+
+```bash
+mcp-manager add events --sse --url-from EVENTS_MCP_URL
+```
 
 `add` saves the reusable definition and enables it in the selected scope.
 Use `--global` or `--project ID|PATH` to select another scope. Repeat
@@ -433,7 +442,13 @@ GET stream. Interrupted SSE streams resume with `Last-Event-ID` when available;
 POST calls are not replayed. Shutdown cancels requests and attempts to delete
 the HTTP session. Configure HTTP authentication through `headers` or
 `headersFrom`; the bridge does not use the agents' native HTTP OAuth logins.
-Legacy HTTP+SSE endpoints are not supported; use a streamable HTTP endpoint.
+
+Servers with `"type": "sse"` use the legacy HTTP+SSE transport instead: the
+manager opens the event stream at the URL, posts each message to the endpoint
+the stream announces, which must share the URL's origin, and relays server
+messages from the stream. A dropped legacy stream ends the session; it is not
+resumed. Either remote type accepts `urlFrom` in place of `url`; the variable
+is read when the server launches.
 
 Requirements and details:
 
@@ -495,13 +510,14 @@ original formatting inside an existing generated file can be lost.
 ## Environment references and inline secrets
 
 Use `env` and `headers` for literal strings. Use `envFrom` to forward named
-environment variables to a `stdio` server and `headersFrom` to map HTTP header
-names to environment variables. Wrapped servers resolve literal values in
-the central config at launch. HTTP header references are forwarded as
-environment variables, then mapped to headers by the manager. Without inline
-mode, the generated references use these forms:
+environment variables to a `stdio` server, `headersFrom` to map HTTP header
+names to environment variables, and `urlFrom` to read a remote server's URL
+from one. Wrapped servers resolve literal values in the central config at
+launch. HTTP header and URL references are forwarded as environment variables,
+then applied by the manager. Without inline mode, the generated references use
+these forms:
 
-| Target | `envFrom` | `headersFrom` |
+| Target | `envFrom` | `headersFrom`, `urlFrom` |
 | --- | --- | --- |
 | Codex | `env_vars` | `env_vars` |
 | Claude Code | `${VARIABLE}` | `${VARIABLE}` |

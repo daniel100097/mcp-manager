@@ -179,11 +179,11 @@ func runStdio(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	mcp := cfg.MCPs[mcpName]
-	if mcp.Type == "http" || len(disabled) > 0 {
+	if mcp.Type != "stdio" || len(disabled) > 0 {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		var code int
-		if mcp.Type == "http" {
+		if mcp.Type != "stdio" {
 			code, err = serveHTTP(ctx, mcp, os.Environ(), disabled, os.Stdin, stdout)
 		} else {
 			var launch wrapper.Launch
@@ -685,6 +685,7 @@ func printLongFlagDefaults(output io.Writer, flags *flag.FlagSet) {
 		"project":        "ID|PATH",
 		"name":           "ID",
 		"url":            "URL",
+		"url-from":       "VARIABLE",
 		"agent":          "AGENT",
 		"env":            "KEY=VALUE",
 		"env-from":       "VARIABLE",

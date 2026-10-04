@@ -376,6 +376,9 @@ func wrapServer(name string, mcp config.MCP, settings renderSettings, projectID 
 			seen[variable] = true
 		}
 	}
+	if mcp.URLFrom != "" && !seen[mcp.URLFrom] {
+		wrapped.EnvFrom = append(wrapped.EnvFrom, mcp.URLFrom)
+	}
 	sort.Strings(wrapped.EnvFrom)
 	return wrapped
 }

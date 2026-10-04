@@ -841,7 +841,7 @@ func sameTransport(left, right config.MCP) bool {
 		equalStrings(left.Args, right.Args) &&
 		equalStringMap(left.Env, right.Env, false) &&
 		equalStringSet(left.EnvFrom, right.EnvFrom) &&
-		left.URL == right.URL &&
+		left.URL == right.URL && left.URLFrom == right.URLFrom &&
 		equalStringMap(left.Headers, right.Headers, true) &&
 		equalStringMap(left.HeadersFrom, right.HeadersFrom, true)
 }

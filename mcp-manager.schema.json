@@ -222,7 +222,8 @@
           "type": "string",
           "enum": [
             "stdio",
-            "http"
+            "http",
+            "sse"
           ]
         },
         "command": {
@@ -253,6 +254,10 @@
           "type": "string",
           "format": "uri",
           "pattern": "^https?://"
+        },
+        "urlFrom": {
+          "$ref": "#/$defs/environmentName",
+          "description": "Environment variable holding the server URL, read when the server launches."
         },
         "headers": {
           "$ref": "#/$defs/headers"
@@ -286,6 +291,11 @@
                 },
                 {
                   "required": [
+                    "urlFrom"
+                  ]
+                },
+                {
+                  "required": [
                     "headers"
                   ]
                 },
@@ -302,7 +312,10 @@
           "if": {
             "properties": {
               "type": {
-                "const": "http"
+                "enum": [
+                  "http",
+                  "sse"
+                ]
               }
             },
             "required": [
@@ -310,8 +323,17 @@
             ]
           },
           "then": {
-            "required": [
-              "url"
+            "oneOf": [
+              {
+                "required": [
+                  "url"
+                ]
+              },
+              {
+                "required": [
+                  "urlFrom"
+                ]
+              }
             ],
             "not": {
               "anyOf": [

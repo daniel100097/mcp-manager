@@ -65,6 +65,19 @@ func TestMCPAddHTTPGloballyWithHeaderReferences(t *testing.T) {
 	assertGeneratedTargetsInSync(t, environment, centralPath, cfg)
 }
 
+func TestMCPAddSSEWithURLReference(t *testing.T) {
+	environment := newMoveTestEnvironment(t)
+	centralPath := filepath.Join(environment.base, "config.json")
+	writeCentralConfig(t, centralPath, environment.config())
+	t.Setenv("EVENTS_MCP_URL", "https://example.com/sse")
+	mcpTestCommand(t, runMCPAdd, "events", "--config", centralPath, "--global", "--sse", "--url-from", "EVENTS_MCP_URL")
+	cfg := loadCentralConfig(t, centralPath)
+	if got, want := cfg.MCPs["events"], (config.MCP{Type: "sse", URLFrom: "EVENTS_MCP_URL"}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("SSE definition = %#v, want %#v", got, want)
+	}
+	assertGeneratedTargetsInSync(t, environment, centralPath, cfg)
+}
+
 func TestMCPAddGlobalCreatesInitialConfiguration(t *testing.T) {
 	environment := newMoveTestEnvironment(t)
 	centralPath := filepath.Join(environment.base, "fresh", "config.json")

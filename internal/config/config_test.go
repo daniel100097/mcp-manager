@@ -378,6 +378,16 @@ func TestParseRejectsInvalidV2Configs(t *testing.T) {
 			wantErr: "absolute http or https URL",
 		},
 		{
+			name:    "url and urlFrom",
+			data:    `{"version":2,"global":{"mcps":[]},"projects":{},"mcps":{"demo":{"type":"sse","url":"https://example.com/sse","urlFrom":"DEMO_URL"}}}`,
+			wantErr: "either url or urlFrom",
+		},
+		{
+			name:    "invalid urlFrom",
+			data:    `{"version":2,"global":{"mcps":[]},"projects":{},"mcps":{"demo":{"type":"sse","urlFrom":"DEMO-URL"}}}`,
+			wantErr: `invalid urlFrom environment variable "DEMO-URL"`,
+		},
+		{
 			name:    "mixed transport fields",
 			data:    `{"version":2,"global":{"mcps":[]},"projects":{},"mcps":{"demo":{"type":"stdio","command":"tool","url":"https://example.com"}}}`,
 			wantErr: "stdio transport cannot set",

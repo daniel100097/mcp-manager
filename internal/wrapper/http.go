@@ -3,6 +3,7 @@ package wrapper
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,12 +39,19 @@ type httpTransport struct {
 	closeOnce                                     sync.Once
 }
 
-// ServeHTTP presents a streamable HTTP MCP as stdio to every supported agent.
-// The agent's initialization, capabilities, IDs and notifications pass through.
+// ServeHTTP presents a streamable HTTP or legacy HTTP+SSE MCP as stdio to every
+// supported agent. The agent's initialization, capabilities, IDs and
+// notifications pass through.
 func ServeHTTP(ctx context.Context, mcp config.MCP, environ, disabled []string, stdin io.ReadCloser, stdout io.Writer) (int, error) {
-	upstream, err := newHTTPTransport(ctx, mcp, environ)
+	transport, err := newHTTPTransport(ctx, mcp, environ)
 	if err != nil {
 		return 1, err
+	}
+	var upstream messageTransport = transport
+	if mcp.Type == "sse" {
+		if upstream, err = transport.connectSSE(); err != nil {
+			return 1, err
+		}
 	}
 	if err := relay(ctx, upstream, disabled, stdin, stdout); err != nil {
 		return 1, err
@@ -52,6 +60,17 @@ func ServeHTTP(ctx context.Context, mcp config.MCP, environ, disabled []string, 
 }
 
 func newHTTPTransport(ctx context.Context, mcp config.MCP, environ []string) (*httpTransport, error) {
+	endpoint := mcp.URL
+	if mcp.URLFrom != "" {
+		value, ok := lookupEnv(environ, mcp.URLFrom)
+		if !ok {
+			return nil, fmt.Errorf("HTTP MCP requires environment variable %q, which is not set", mcp.URLFrom)
+		}
+		if err := config.ValidateURL(value); err != nil {
+			return nil, fmt.Errorf("HTTP MCP URL from %q: %w", mcp.URLFrom, err)
+		}
+		endpoint = value
+	}
 	headers := make(http.Header)
 	for name, value := range mcp.Headers {
 		headers.Set(name, value)
@@ -69,7 +88,7 @@ func newHTTPTransport(ctx context.Context, mcp config.MCP, environ []string) (*h
 	ctx, cancel := context.WithCancel(ctx)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &httpTransport{
-		endpoint: mcp.URL, headers: headers, ctx: ctx, cancel: cancel,
+		endpoint: endpoint, headers: headers, ctx: ctx, cancel: cancel,
 		incoming: make(chan httpMessage, 32), inputDone: make(chan struct{}),
 		client: &http.Client{Transport: transport, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			// Header credentials belong to the configured origin, including custom
@@ -343,7 +362,12 @@ func (h *httpTransport) listen(ctx context.Context, resp *http.Response, key str
 			}
 		}
 		previousID := lastID
-		complete, err := readEventStream(resp.Body, &lastID, &delay, func(raw json.RawMessage) (bool, error) { return h.forward(raw, key) })
+		complete, err := readEventStream(resp.Body, &lastID, &delay, func(event string, raw json.RawMessage) (bool, error) {
+			if event != "message" {
+				return false, nil
+			}
+			return h.forward(raw, key)
+		})
 		resp.Body.Close()
 		resp = nil
 		if complete {
@@ -404,6 +428,79 @@ func (h *httpTransport) Close() error {
 	return nil
 }
 
+// sseTransport speaks the legacy HTTP+SSE transport: one GET event stream
+// carries every server message, and its endpoint event names the URL that
+// receives each client message as a POST.
+type sseTransport struct{ *httpTransport }
+
+func (h *httpTransport) connectSSE() (*sseTransport, error) {
+	resp, err := h.request(h.ctx, http.MethodGet, nil, "")
+	if err != nil {
+		h.Close()
+		return nil, err
+	}
+	contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if resp.StatusCode != http.StatusOK || contentType != "text/event-stream" {
+		resp.Body.Close()
+		h.Close()
+		return nil, fmt.Errorf("SSE MCP GET returned %s without an event stream", resp.Status)
+	}
+	ready := make(chan error, 1)
+	h.workers.Add(1)
+	go func() {
+		defer h.workers.Done()
+		defer resp.Body.Close()
+		var lastID string
+		var retry time.Duration
+		connected := false
+		_, err := readEventStream(resp.Body, &lastID, &retry, func(event string, data json.RawMessage) (bool, error) {
+			switch {
+			case event == "endpoint" && !connected:
+				// Header credentials must not leave the server's origin.
+				base := resp.Request.URL
+				target, err := base.Parse(strings.TrimSpace(string(data)))
+				if err != nil || target.Scheme != base.Scheme || target.Host != base.Host {
+					return false, errors.New("endpoint must share the server's origin")
+				}
+				h.endpoint, connected = target.String(), true
+				ready <- nil
+			case event == "message" && connected:
+				h.deliver(data, nil)
+			}
+			return false, nil
+		})
+		if !connected {
+			ready <- fmt.Errorf("connect SSE MCP: %w", err)
+			return
+		}
+		h.deliver(nil, err)
+	}()
+	if err := <-ready; err != nil {
+		h.Close()
+		return nil, err
+	}
+	return &sseTransport{h}, nil
+}
+
+// Write posts a client message to the announced endpoint. Replies arrive on
+// the event stream, so the POST response carries nothing to forward.
+func (s *sseTransport) Write(ctx context.Context, raw json.RawMessage) error {
+	resp, err := s.request(ctx, http.MethodPost, bytes.NewReader(raw), "")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("SSE MCP POST returned %s", resp.Status)
+	}
+	return nil
+}
+
+// CloseInput keeps the stream open: replies to pending calls still arrive on
+// it. ponytail: stdin EOF therefore waits out the relay's 2s grace; count
+// pending calls if a faster exit matters (agents normally signal instead).
+func (s *sseTransport) CloseInput() {}
+
 type invalidEventError struct{ err error }
 
 func (e *invalidEventError) Error() string { return "invalid HTTP MCP event: " + e.err.Error() }
@@ -411,7 +508,8 @@ func (e *invalidEventError) Unwrap() error { return e.err }
 
 // SSE data lines may span multiple lines and exceed bufio.Scanner's 64 KiB
 // default. Comments, LF/CRLF/CR, event IDs, and retry hints are supported.
-func readEventStream(reader io.Reader, lastID *string, retry *time.Duration, emit func(json.RawMessage) (bool, error)) (bool, error) {
+// emit receives each event's type, "message" when unnamed, and its data.
+func readEventStream(reader io.Reader, lastID *string, retry *time.Duration, emit func(string, json.RawMessage) (bool, error)) (bool, error) {
 	input := bufio.NewReader(reader)
 	var data []string
 	event := ""
@@ -452,8 +550,8 @@ func readEventStream(reader io.Reader, lastID *string, retry *time.Duration, emi
 		}
 		if line == "" {
 			*lastID = pendingID
-			if len(data) > 0 && (event == "" || event == "message") {
-				done, err := emit(json.RawMessage(strings.Join(data, "\n")))
+			if len(data) > 0 {
+				done, err := emit(cmp.Or(event, "message"), json.RawMessage(strings.Join(data, "\n")))
 				if err != nil {
 					return false, &invalidEventError{err}
 				}

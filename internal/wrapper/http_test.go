@@ -189,7 +189,7 @@ func TestSSESupportsLargeMultilineDataAndComments(t *testing.T) {
 	input := ": keepalive\r\nid: abc\r\nretry: 25\r\nevent: message\r\ndata: {\"value\":\"" + payload + "\",\r\ndata: \"ok\":true}\r\n\r\n"
 	var id string
 	var retry time.Duration
-	done, err := readEventStream(strings.NewReader(input), &id, &retry, func(raw json.RawMessage) (bool, error) {
+	done, err := readEventStream(strings.NewReader(input), &id, &retry, func(_ string, raw json.RawMessage) (bool, error) {
 		var result struct {
 			Value string
 			OK    bool
@@ -327,12 +327,80 @@ func TestHTTPFailuresAndRedirectsDoNotLeakCredentials(t *testing.T) {
 	if err == nil || reached.Load() {
 		t.Fatalf("cross-origin redirect was followed: %v", err)
 	}
+	announcer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "event: endpoint\ndata: %s/messages\n\n", destination.URL)
+	}))
+	defer announcer.Close()
+	input = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_, err = ServeHTTP(context.Background(), config.MCP{Type: "sse", URL: announcer.URL, Headers: map[string]string{"X-API-Key": "credential"}}, nil, nil, input, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "origin") || reached.Load() {
+		t.Fatalf("cross-origin SSE endpoint was used: %v", err)
+	}
+}
+
+func TestServeSSEFromURLVariable(t *testing.T) {
+	events := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Error("missing SSE credentials")
+		}
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "event: endpoint\ndata: /messages?session=one\n\n")
+			w.(http.Flusher).Flush()
+			for {
+				select {
+				case event := <-events:
+					fmt.Fprintf(w, "event: message\ndata: %s\n\n", event)
+					w.(http.Flusher).Flush()
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}
+		if r.URL.Path != "/messages" || r.URL.Query().Get("session") != "one" {
+			t.Errorf("POST to %s, want the announced endpoint", r.URL)
+		}
+		var msg wireMessage
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		var result any
+		switch msg.Method {
+		case "initialize":
+			result = map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "fixture", "version": "1"}}
+		case "tools/list":
+			result = map[string]any{"tools": []any{map[string]any{"name": "read", "inputSchema": map[string]any{}}, map[string]any{"name": "delete", "inputSchema": map[string]any{}}}}
+		default:
+			return
+		}
+		raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": result})
+		events <- string(raw)
+	}))
+	defer server.Close()
+	mcp := config.MCP{Type: "sse", URLFrom: "EVENTS_URL", HeadersFrom: map[string]string{"Authorization": "TOKEN"}}
+	environ := []string{"EVENTS_URL=" + server.URL + "/sse", "TOKEN=Bearer test-token"}
+	p := startProxy(t, func(ctx context.Context, input io.ReadCloser, output io.Writer) (int, error) {
+		return ServeHTTP(ctx, mcp, environ, []string{"delete"}, input, output)
+	})
+	p.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}`)
+	if raw := p.next(t); !bytes.Contains(raw, []byte(`"protocolVersion":"2024-11-05"`)) {
+		t.Fatalf("initialize: %s", raw)
+	}
+	p.send(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	p.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if raw := p.next(t); bytes.Contains(raw, []byte(`"delete"`)) || !bytes.Contains(raw, []byte(`"read"`)) {
+		t.Fatalf("list: %s", raw)
+	}
+	p.stop(t, 0)
 }
 
 func TestSSECursorOnlyCommitsCompleteEvents(t *testing.T) {
 	id := "previous"
 	var retry time.Duration
-	_, err := readEventStream(strings.NewReader("id: undelivered\ndata: {"), &id, &retry, func(json.RawMessage) (bool, error) { t.Fatal("incomplete event delivered"); return false, nil })
+	_, err := readEventStream(strings.NewReader("id: undelivered\ndata: {"), &id, &retry, func(string, json.RawMessage) (bool, error) { t.Fatal("incomplete event delivered"); return false, nil })
 	if err == nil || id != "previous" {
 		t.Fatalf("incomplete event advanced cursor: %q %v", id, err)
 	}
@@ -343,7 +411,7 @@ func TestSSELineEndings(t *testing.T) {
 		t.Run(fmt.Sprintf("%q", ending), func(t *testing.T) {
 			var id string
 			var retry time.Duration
-			done, err := readEventStream(strings.NewReader("data: {}"+ending+ending), &id, &retry, func(json.RawMessage) (bool, error) { return true, nil })
+			done, err := readEventStream(strings.NewReader("data: {}"+ending+ending), &id, &retry, func(string, json.RawMessage) (bool, error) { return true, nil })
 			if !done || err != nil {
 				t.Fatalf("line ending %q: %v %v", ending, done, err)
 			}

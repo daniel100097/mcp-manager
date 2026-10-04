@@ -35,6 +35,8 @@ func runMCPAdd(args []string, stdout, stderr io.Writer) int {
 	global := flags.Bool("global", false, "activate the MCP globally")
 	local := flags.Bool("local", false, "activate the MCP for the current project (default)")
 	url := flags.String("url", "", "HTTP MCP server URL")
+	urlFrom := flags.String("url-from", "", "environment variable holding the HTTP MCP server URL, read at launch")
+	sse := flags.Bool("sse", false, "use the legacy HTTP+SSE transport instead of streamable HTTP")
 	replace := flags.Bool("replace", false, "replace an existing definition, preserving its other scope settings")
 	dryRun := flags.Bool("dry-run", false, "show all changes without writing files")
 	var env, envFrom, headers, headersFrom, disabledAgents, disabledTools mcpStringFlags
@@ -46,7 +48,7 @@ func runMCPAdd(args []string, stdout, stderr io.Writer) int {
 	flags.Var(&disabledAgents, "disabled-agent", "agent to exclude in this scope: codex, claude, or opencode (repeatable)")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, `Usage: mcp-manager add NAME [options] -- COMMAND [ARGS...]
-       mcp-manager add NAME --url URL [options]
+       mcp-manager add NAME --url URL|--url-from VAR [--sse] [options]
 
 Adds a definition and activates it for the current registered project.
 Use --global to make it available everywhere. Run project add first to
@@ -56,6 +58,7 @@ Examples:
   mcp-manager add files -- npx -y @modelcontextprotocol/server-filesystem .
   mcp-manager add api --global --url https://example.com/mcp
   mcp-manager add api --replace --url https://example.com/new-mcp
+  mcp-manager add events --sse --url-from EVENTS_MCP_URL
 
 Options:`)
 		printLongFlagDefaults(stderr, flags)
@@ -87,19 +90,24 @@ Options:`)
 		fmt.Fprintln(stderr, "error: --global cannot be combined with --local or --project")
 		return 2
 	}
-	if *url != "" && hasSeparator {
-		fmt.Fprintln(stderr, "error: choose --url for HTTP or -- COMMAND for stdio")
+	remote := *url != "" || *urlFrom != ""
+	if remote && hasSeparator {
+		fmt.Fprintln(stderr, "error: choose --url or --url-from for HTTP, or -- COMMAND for stdio")
 		return 2
 	}
-	if *url == "" && len(serverArgs) == 0 {
-		fmt.Fprintln(stderr, "error: provide --url URL or a server command after --")
+	if !remote && len(serverArgs) == 0 {
+		fmt.Fprintln(stderr, "error: provide --url URL, --url-from VAR, or a server command after --")
 		return 2
 	}
-	mcp := config.MCP{Type: "http", URL: *url, EnvFrom: envFrom}
+	mcp := config.MCP{Type: "http", URL: *url, URLFrom: *urlFrom, EnvFrom: envFrom}
 	if len(serverArgs) > 0 {
 		mcp.Type = "stdio"
 		mcp.Command = serverArgs[0]
 		mcp.Args = append([]string(nil), serverArgs[1:]...)
+	}
+	if *sse {
+		// With a stdio command, validation rejects the mixed definition.
+		mcp.Type = "sse"
 	}
 	if mcp.Env, err = mcpAssignments("--env", env); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)

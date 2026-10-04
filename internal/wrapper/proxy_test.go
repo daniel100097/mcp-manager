@@ -43,6 +43,8 @@ func startProxy(t *testing.T, serve func(context.Context, io.ReadCloser, io.Writ
 	}()
 	go func() {
 		code, err := serve(ctx, inputReader, outputWriter)
+		// A proxy that exits early fails later sends instead of blocking them.
+		inputReader.CloseWithError(fmt.Errorf("proxy exited with %d: %v", code, err))
 		outputWriter.Close()
 		p.result <- proxyResult{code, err}
 	}()
