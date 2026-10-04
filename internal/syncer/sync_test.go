@@ -390,6 +390,105 @@ func TestSyncPrevalidatesEveryDestinationBeforeWriting(t *testing.T) {
 	assertFileBytes(t, codexPath, original)
 }
 
+func TestSyncWritesThroughSymlinkedDestinations(t *testing.T) {
+	base := t.TempDir()
+	options := testOptions(t, base)
+	project := filepath.Join(base, "project")
+	dotfiles := filepath.Join(base, "dotfiles")
+	mustMkdir(t, project)
+	cfg := symlinkTestConfig(project)
+
+	globalClaude := filepath.Join(dotfiles, "claude.json")
+	projectClaude := filepath.Join(dotfiles, "project.mcp.json")
+	projectOpenCode := filepath.Join(dotfiles, "opencode.json")
+	mustWrite(t, globalClaude, []byte(`{"theme":"dark"}`), 0o600)
+	mustWrite(t, projectClaude, []byte(`{"keep":true}`), 0o640)
+	links := map[string]string{
+		filepath.Join(options.HomeDir, ".claude.json"): "../dotfiles/claude.json",
+		filepath.Join(project, ".mcp.json"):            projectClaude,
+		// Dangling: sync creates the file the link points to.
+		filepath.Join(project, "opencode.json"): "../dotfiles/opencode.json",
+	}
+	for link, target := range links {
+		mustSymlink(t, target, link)
+	}
+
+	result, err := Sync(cfg, options)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if len(result.Changes) != 6 {
+		t.Fatalf("len(Changes) = %d, want 6: %#v", len(result.Changes), result.Changes)
+	}
+	reported := map[string]bool{}
+	for _, change := range result.Changes {
+		reported[change.Path] = true
+	}
+	for link, target := range links {
+		if !reported[link] {
+			t.Fatalf("changes %#v do not report the agent config %s", result.Changes, link)
+		}
+		if got, err := os.Readlink(link); err != nil || got != target {
+			t.Fatalf("Readlink(%s) = %q, %v; want the link to %q kept", link, got, err, target)
+		}
+	}
+	globalDocument := readJSON(t, globalClaude)
+	if globalDocument["theme"] != "dark" {
+		t.Fatalf("global Claude settings lost: %#v", globalDocument)
+	}
+	assertKeys(t, nestedMap(t, globalDocument, "mcpServers"), "local")
+	projectDocument := readJSON(t, projectClaude)
+	if projectDocument["keep"] != true || fileMode(t, projectClaude) != 0o640 {
+		t.Fatalf("project Claude target = %#v with mode %v; want settings and mode kept", projectDocument, fileMode(t, projectClaude))
+	}
+	assertKeys(t, nestedMap(t, projectDocument, "mcpServers"), "local")
+	assertKeys(t, nestedMap(t, readJSON(t, projectOpenCode), "mcp"), "local")
+	if mode := fileMode(t, projectOpenCode); mode != 0o600 {
+		t.Fatalf("created link target mode = %v, want 0600", mode)
+	}
+
+	again, err := Sync(cfg, options)
+	if err != nil || len(again.Changes) != 0 || again.Unchanged != 6 {
+		t.Fatalf("second Sync() = %#v, %v; want six unchanged targets", again, err)
+	}
+}
+
+func TestSyncRejectsScopesSharingASymlinkedFile(t *testing.T) {
+	base := t.TempDir()
+	options := testOptions(t, base)
+	project := filepath.Join(base, "project")
+	mustMkdir(t, project)
+	globalClaude := filepath.Join(options.HomeDir, ".claude.json")
+	original := []byte(`{"theme":"dark"}`)
+	mustWrite(t, globalClaude, original, 0o600)
+	mustSymlink(t, globalClaude, filepath.Join(project, ".mcp.json"))
+
+	_, err := Sync(symlinkTestConfig(project), options)
+	if err == nil || !strings.Contains(err.Error(), "target collision") ||
+		!strings.Contains(err.Error(), "claude/global") || !strings.Contains(err.Error(), "claude/project") {
+		t.Fatalf("Sync() error = %v, want a collision between the global and project Claude configs", err)
+	}
+	assertFileBytes(t, globalClaude, original)
+	if _, err := os.Stat(filepath.Join(options.HomeDir, ".codex", "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("rejected Sync() wrote another target: %v", err)
+	}
+}
+
+func symlinkTestConfig(project string) *config.Config {
+	return &config.Config{
+		Version: config.CurrentVersion,
+		Global: config.Scope{
+			MCPs: []string{"local"}, DisabledAgents: map[string][]config.Agent{},
+		},
+		Projects: map[string]config.Project{
+			"project": {Path: project, MCPs: []string{"local"}, DisabledAgents: map[string][]config.Agent{}},
+		},
+		MCPs: map[string]config.MCP{
+			"local": {Type: "stdio", Command: "tool"},
+		},
+	}
+}
+
 func TestSyncDryRunDoesNotWrite(t *testing.T) {
 	options := testOptions(t, t.TempDir())
 	options.DryRun = true
@@ -466,6 +565,14 @@ func mustWrite(t *testing.T, path string, data []byte, mode os.FileMode) {
 	t.Helper()
 	mustMkdir(t, filepath.Dir(path))
 	if err := os.WriteFile(path, data, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	mustMkdir(t, filepath.Dir(link))
+	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
 }

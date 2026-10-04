@@ -61,6 +61,42 @@ func optIn(cfg *config.Config, id string) {
 	cfg.Projects[id] = project
 }
 
+func TestSyncWritesFileSharedByWorktreeLinksOnce(t *testing.T) {
+	cfg, options, root, linked := worktreeFixture(t)
+	optIn(cfg, "repo")
+	shared := filepath.Join(root, ".mcp.json")
+	mustWrite(t, shared, []byte(`{"keep":true}`), 0o600)
+	link := filepath.Join(linked, ".mcp.json")
+	mustSymlink(t, shared, link)
+
+	result, err := Sync(cfg, options)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	var claudePaths []string
+	for _, change := range result.Changes {
+		if change.Agent == config.AgentClaude && change.Scope == "repo" {
+			claudePaths = append(claudePaths, change.Path)
+		}
+	}
+	if !reflect.DeepEqual(claudePaths, []string{shared}) {
+		t.Fatalf("Claude project changes = %v, want the shared file once", claudePaths)
+	}
+	if got, err := os.Readlink(link); err != nil || got != shared {
+		t.Fatalf("Readlink(%s) = %q, %v; want the link kept", link, got, err)
+	}
+	document := readJSON(t, shared)
+	if document["keep"] != true {
+		t.Fatalf("shared Claude settings lost: %#v", document)
+	}
+	assertKeys(t, nestedMap(t, document, "mcpServers"), "local")
+
+	again, err := Sync(cfg, options)
+	if err != nil || len(again.Changes) != 0 {
+		t.Fatalf("second Sync() = %#v, %v; want no changes", again, err)
+	}
+}
+
 func TestSyncWorktreesOptInAndInheritance(t *testing.T) {
 	cfg, options, root, linked := worktreeFixture(t)
 	if _, err := Sync(cfg, options); err != nil {

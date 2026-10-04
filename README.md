@@ -479,7 +479,14 @@ Old MCP entries are removed, including entries excluded by `disabledAgents` in
 that scope; all unrelated top-level settings remain. Before writing,
 `mcp-manager` parses every existing destination and renders every result in
 memory. Files are then replaced atomically one at a time, existing permissions
-are retained, new files use mode `0600`, and symlink destinations are refused.
+are retained, and new files use mode `0600`.
+
+Symbolic links are followed, for agent configs as well as the central and local
+config files: the file a link points to is updated, or created when it is
+missing, and the link itself stays in place. Targets of the same agent and
+scope may share a file, such as worktrees that link one `.mcp.json`; it is
+written once. Any other targets that resolve to the same file are rejected as
+a collision before anything is written.
 
 JSONC input is accepted, but generated JSON is normalized to JSON. TOML and
 JSON are semantically preserved rather than textually patched, so comments and

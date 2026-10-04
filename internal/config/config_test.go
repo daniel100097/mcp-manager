@@ -971,26 +971,57 @@ func TestOpenOrCreateEditRejectsInvalidExistingFilesWithoutCreatingBase(t *testi
 	}
 }
 
-func TestOpenOrCreateEditRejectsOverlaySymlinkBeforeSavingBase(t *testing.T) {
+func TestOpenOrCreateEditSavesOverlayThroughSymlink(t *testing.T) {
 	home := t.TempDir()
 	source := Source{Path: filepath.Join(home, "config.json"), LocalPath: filepath.Join(home, "config.local.json")}
-	target := filepath.Join(home, "actual.local.json")
-	writeTestFile(t, target, `{}`)
-	if err := os.Symlink(target, source.LocalPath); err != nil {
+	writeTestFile(t, filepath.Join(home, "dotfiles", "config.local.json"), `{}`)
+	if err := os.Symlink(filepath.Join("dotfiles", "config.local.json"), source.LocalPath); err != nil {
 		t.Fatal(err)
 	}
 	edit, err := source.OpenOrCreateEdit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := edit.Save(); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("Save() error = %v; want refused symlink", err)
+	edit.Config.MCPs["added"] = MCP{Type: "stdio", Command: "server"}
+	edit.Config.Global.MCPs = []string{"added"}
+	if err := edit.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if link, err := os.Readlink(source.LocalPath); err != nil || link != filepath.Join("dotfiles", "config.local.json") {
+		t.Fatalf("Save() replaced the overlay link: %q, %v", link, err)
+	}
+	if got := readTestFile(t, source.Path); strings.Contains(got, "added") {
+		t.Fatalf("Save() wrote the edit to the central base: %s", got)
+	}
+	loaded, err := source.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.MCPs["added"].Command != "server" {
+		t.Fatalf("saved config = %#v", loaded)
+	}
+}
+
+func TestOpenOrCreateEditRejectsInvalidOverlayBeforeSavingBase(t *testing.T) {
+	home := t.TempDir()
+	source := Source{Path: filepath.Join(home, "config.json"), LocalPath: filepath.Join(home, "config.local.json")}
+	writeTestFile(t, source.LocalPath, `{}`)
+	edit, err := source.OpenOrCreateEdit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The overlay turns into a link to a directory before Save.
+	if err := os.Remove(source.LocalPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(home, source.LocalPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.Save(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("Save() error = %v; want invalid overlay destination", err)
 	}
 	if _, err := os.Stat(source.Path); !os.IsNotExist(err) {
 		t.Fatalf("failed Save() created central base: %v", err)
-	}
-	if got := readTestFile(t, target); got != `{}` {
-		t.Fatalf("failed Save() changed overlay target: %s", got)
 	}
 }
 

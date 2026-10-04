@@ -64,7 +64,9 @@ const (
 )
 
 type target struct {
-	path      string
+	path string
+	// file is path with symbolic links resolved: the file that sync replaces.
+	file      string
 	agent     config.Agent
 	scope     string
 	projectID string
@@ -145,7 +147,7 @@ func Sync(cfg *config.Config, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if err := rejectTargetCollisions(targets); err != nil {
+	if targets, err = resolveTargets(targets); err != nil {
 		return Result{}, err
 	}
 	settings, err := newRenderSettings(cfg, options)
@@ -173,7 +175,7 @@ func Sync(cfg *config.Config, options Options) (Result, error) {
 
 	if !options.DryRun {
 		for _, plan := range plans {
-			if err := fileutil.WriteAtomic(plan.target.path, plan.data, plan.mode); err != nil {
+			if err := fileutil.WriteAtomic(plan.target.file, plan.data, plan.mode); err != nil {
 				return Result{}, fmt.Errorf("write %q: %w", plan.target.path, err)
 			}
 		}
@@ -284,23 +286,34 @@ func buildTargets(cfg *config.Config, options Options) ([]target, error) {
 	return targets, nil
 }
 
-func rejectTargetCollisions(targets []target) error {
+// resolveTargets follows symbolic links to the file behind each target.
+// Targets of the same agent and scope render identical content, so they may
+// share a file, such as worktrees linking one .mcp.json; it is written once.
+// Any other shared file is a collision.
+func resolveTargets(targets []target) ([]target, error) {
+	resolved := make([]target, 0, len(targets))
 	seen := make(map[string]target, len(targets))
 	for _, current := range targets {
 		absolute, err := filepath.Abs(current.path)
 		if err != nil {
-			return fmt.Errorf("resolve target path %q: %w", current.path, err)
+			return nil, fmt.Errorf("resolve target path %q: %w", current.path, err)
 		}
-		clean := filepath.Clean(absolute)
-		if previous, duplicate := seen[clean]; duplicate {
-			return fmt.Errorf(
+		if current.file, err = fileutil.ResolveSymlinks(absolute); err != nil {
+			return nil, fmt.Errorf("resolve target path %q: %w", current.path, err)
+		}
+		if previous, duplicate := seen[current.file]; duplicate {
+			if previous.agent == current.agent && previous.projectID == current.projectID {
+				continue
+			}
+			return nil, fmt.Errorf(
 				"target collision at %q between %s/%s and %s/%s",
-				clean, previous.agent, previous.scope, current.agent, current.scope,
+				current.file, previous.agent, previous.scope, current.agent, current.scope,
 			)
 		}
-		seen[clean] = current
+		seen[current.file] = current
+		resolved = append(resolved, current)
 	}
-	return nil
+	return resolved, nil
 }
 
 func renderServers(cfg *config.Config, agent config.Agent, projectID string, settings renderSettings) (map[string]any, error) {
@@ -532,16 +545,15 @@ func prepareWrite(destination target, servers map[string]any) (plannedWrite, boo
 	return plannedWrite{target: destination, data: generated, mode: mode, count: len(servers)}, true, nil
 }
 
+// readDestination follows symbolic links, so a dangling link reads as a
+// missing file.
 func readDestination(path string) ([]byte, os.FileMode, bool, error) {
-	info, err := os.Lstat(path)
+	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, 0o600, false, nil
 	}
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("inspect destination %q: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, 0, false, fmt.Errorf("destination %q is a symlink; refusing to replace it", path)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, 0, false, fmt.Errorf("destination %q is not a regular file", path)
